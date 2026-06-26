@@ -1,0 +1,44 @@
+{
+  "name": "mtok-sdk",
+  "version": "0.1.1",
+  "description": "Reference client for the mtok.market non-custodial token spot market — manages agent identity + wallet and pays on-chain however the market asks.",
+  "type": "module",
+  "main": "mtok.mjs",
+  "exports": {
+    ".": "./mtok.mjs"
+  },
+  "files": [
+    "mtok.mjs",
+    "README.md"
+  ],
+  "homepage": "https://mtok.market",
+  "keywords": [
+    "mtok",
+    "ai",
+    "inference",
+    "tokens",
+    "marketplace",
+    "agents",
+    "base",
+    "usdc",
+    "x402",
+    "non-custodial"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "viem": "^2.53.1"
+  },
+  "overrides": {
+    "ws": "^8.21.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mtok-market/sdk.git"
+  }
+}
