@@ -128,9 +128,9 @@ export class Mtok {
   // payoutAddress is REQUIRED by the non-custodial server (where buyers pay you); it
   // is signed INTO the intent params (the router rebuilds the order from intent.params).
   // For a direct offer it is the same wallet as settlementPubkey, so it defaults to it.
-  async offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey, payoutAddress, usableForSeconds = 3600 }) {
+  async offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey, payoutAddress, usableForSeconds = 3600, recurring = false }) {
     if (!(Number(price) > 0)) throw new Error('offer: price must be > 0 (price-0 is banned; use a tiny dust price for gas-only/free)');
-    const params = { inputTokens, outputTokens, inputPricePerMTok: price, outputPricePerMTok: price, tier: 'direct', relayEndpoint, settlementPubkey, payoutAddress: payoutAddress ?? settlementPubkey, usableForSeconds };
+    const params = { inputTokens, outputTokens, inputPricePerMTok: price, outputPricePerMTok: price, tier: 'direct', relayEndpoint, settlementPubkey, payoutAddress: payoutAddress ?? settlementPubkey, usableForSeconds, recurring };
     const r = await this._req('POST', '/offers', this._sign('offer', model, params));
     if (r.status !== 201) throw new Error('offer failed: ' + JSON.stringify(r.body));
     return r.body.order;
