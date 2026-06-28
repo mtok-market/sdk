@@ -269,7 +269,7 @@ export class Mtok {
   //     returns the confirmed txHash; default: real EIP-3009 via _buildAuth+_submitAuthSelf
   //   _stubApi — { reputation, affirm, dispute, config } — default: real platform API calls
   //
-  // CHUNK_FLOOR = 0.50 (matches DEFAULT_REP_KNOBS.chunkFloorUsd in api/src/core/reputation.js)
+  // CHUNK_FLOOR = 0.10 (matches DEFAULT_REP_KNOBS.chunkFloorUsd in api/src/core/reputation.js)
   async drawFromSeller({
     offer,          // { id, tier, relayEndpoint, model, inputPricePerMTok, outputPricePerMTok, agentId, settlementPubkey }
     totalNeedUsd,   // HARD CAP on total USD to FUND across the run
@@ -281,7 +281,7 @@ export class Mtok {
     signChunkAuth,  // injectable signer; default: this.signChunkAuth or real EIP-3009
     feeBps = 250,   // platform fee in basis points (must stay in sync with server-side default)
   } = {}) {
-    const CHUNK_FLOOR = 0.50; // must stay in sync with DEFAULT_REP_KNOBS.chunkFloorUsd
+    const CHUNK_FLOOR = 0.10; // must stay in sync with DEFAULT_REP_KNOBS.chunkFloorUsd
 
     // Resolve injectables — prefer call-site overrides, then instance-level overrides, then real defaults.
     const _relayFetch = relayFetch ?? this.relayFetch ?? (async (params) => {
