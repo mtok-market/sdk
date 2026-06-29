@@ -29,6 +29,12 @@ const signIntent = (intent, privKey) => crypto.sign(null, Buffer.from(canonicalI
 // per-leg settlement nonce (must match settlement.js legNonce)
 const legNonce = (base, label) => '0x' + crypto.createHash('sha256').update(Buffer.from(String(base).replace(/^0x/, ''), 'hex')).update(String(label)).digest('hex');
 const usdToAtomic = (u) => BigInt(Math.round(Number(u) * 1e6));
+const requiresFeeLeg = ({ amountUsd, feeAddress, feeBps, dustThresholdUsd = 0.001 }) => {
+  const amount = Number(amountUsd) || 0;
+  const bps = Number(feeBps) || 0;
+  const dust = Number(dustThresholdUsd) || 0.001;
+  return Boolean(feeAddress) && bps > 0 && amount >= dust && amount * bps / 10000 > 0;
+};
 const ETH_GAS_RESERVE = 0.0005; // ~enough native gas for several Base txns
 
 const ERC20 = parseAbi([
@@ -41,11 +47,9 @@ const ERC20 = parseAbi([
 ]);
 const TWA = parseAbi(['function transferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce,uint8 v,bytes32 r,bytes32 s)']);
 const META = parseAbi(['function authorizationState(address authorizer, bytes32 nonce) view returns (bool)', 'event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)']);
-const ESCROW = parseAbi(['function escrow(bytes32 id, address seller, address feeAddr, uint96 sellerAmount, uint96 feeAmount, uint64 ttl)']);
-
 // #64: canonical platform fee addresses, pinned per chain so a tampered /api/config
 // cannot redirect the fee leg. Public, stable platform treasury addresses (also in
-// web/llms.txt + the buying guide so non-SDK agents can pin them too).
+// site/static/llms.txt + the buying guide so non-SDK agents can pin them too).
 export const PINNED_FEE_ADDRESSES = {
   8453: '0x6B5FED4aca54Ca89d95b822fD64c8545D34B673b',  // Base mainnet (mtok.market)
   84532: '0x25EFcbfD32C3f769690aA1181d48565f69c855E1', // Base Sepolia (staging/testnet)
@@ -344,6 +348,7 @@ export class Mtok {
     // expected feeBps and ignore the fetched rate; unknown chains fall back to config (same caveat
     // as the address). This also keeps the fee bounded so it can't blow past totalNeedUsd.
     const feeRateBps = pinnedFee ? feeBps : (Number(config.feeBps) || feeBps);
+    const dustThresholdUsd = Number(config.dustThresholdUsd) || 0.001;
 
     // Estimate a draw's cost (USD) so we know when to top up. Use the offer's output
     // price against the request's max_tokens (a generous upper bound; actual metered
@@ -379,10 +384,12 @@ export class Mtok {
           leg: 'seller', to: offer.settlementPubkey, amountUsd: chunkUsd,
           nonce: '0x' + crypto.randomBytes(32).toString('hex'), offerId: offer.id, n: fundN,
         }));
-        feeTxHash = await Promise.resolve(_signChunkAuth({
-          leg: 'fee', to: config.feeAddress, amountUsd: chunkUsd * feeRateBps / 10000,
-          nonce: '0x' + crypto.randomBytes(32).toString('hex'), offerId: offer.id, n: fundN,
-        }));
+        if (requiresFeeLeg({ amountUsd: chunkUsd, feeAddress: config.feeAddress, feeBps: feeRateBps, dustThresholdUsd })) {
+          feeTxHash = await Promise.resolve(_signChunkAuth({
+            leg: 'fee', to: config.feeAddress, amountUsd: chunkUsd * feeRateBps / 10000,
+            nonce: '0x' + crypto.randomBytes(32).toString('hex'), offerId: offer.id, n: fundN,
+          }));
+        }
       } catch (e) {
         return { ok: false, error: e };
       }
