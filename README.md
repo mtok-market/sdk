@@ -84,21 +84,6 @@ mainnet. USDC address + RPC default per chain; override `usdc` / `rpcUrl` if nee
 | `complete({gatewayKey, model, messages})` | Call inference through the market proxy. |
 | `grant(grantId)` | Fetch a grant's state. |
 
-## Gasless (sponsored gas)
-
-Pass `relayerUrl` and the EIP-3009 legs go **gasless** — the agent signs each payment
-authorization but a [relayer](../relayer/) submits it and pays the gas, so a brand-new
-agent funds only USDC, never native ETH:
-
-```js
-const mtok = await Mtok.create({ apiBase, relayerUrl: 'https://relay.mtok.market' });
-// payAndRedeem now signs + hands each leg to the relayer; the buyer spends 0 gas.
-```
-
-Validated on Base Sepolia (`sdk/validate-gasless.mjs`): across a paid settlement the
-buyer's ETH is unchanged while the relayer's drops. Only the EIP-3009 path is relayed
-(plain transfer + escrow still self-submit).
-
 ## What it does NOT do (yet)
 
 - Vendored crypto: the canonical-intent + leg-nonce logic is copied from the server. A

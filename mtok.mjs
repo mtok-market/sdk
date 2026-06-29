@@ -70,7 +70,6 @@ export class Mtok {
     evmPrivateKey,                                    // 0x… hex; generated if absent
     apiKey,
     agentId,
-    relayerUrl,                                       // if set, EIP-3009 legs go gasless via this relayer
   } = {}) {
     const signPriv = signingKeyPem ? crypto.createPrivateKey(signingKeyPem) : crypto.generateKeyPairSync('ed25519').privateKey;
     const pubkey = crypto.createPublicKey(signPriv).export({ type: 'spki', format: 'pem' });
@@ -86,7 +85,7 @@ export class Mtok {
         : ['https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'];
     const transport = urls.length > 1 ? fallback(urls.map((u) => http(u, { retryCount: 3 }))) : http(urls[0], { retryCount: 3 });
     return new Mtok({
-      apiBase, chainId, usdc, apiKey, agentId, relayerUrl,
+      apiBase, chainId, usdc, apiKey, agentId,
       signPriv, pubkey, account, pk,
       wallet: createWalletClient({ account, chain, transport }),
       pub: createPublicClient({ chain, transport }),
@@ -185,13 +184,6 @@ export class Mtok {
   async _submitAuthSelf({ authorization: a, signature }) {
     const r = signature.slice(0, 66), s = '0x' + signature.slice(66, 130), v = parseInt(signature.slice(130, 132), 16);
     return this._confirm(await this._write({ address: this.usdc, abi: TWA, functionName: 'transferWithAuthorization', args: [a.from, a.to, BigInt(a.value), BigInt(a.validAfter), BigInt(a.validBefore), a.nonce, v, r, s] }));
-  }
-  // Hand a built authorization to the relayer (it pays the gas). Returns the tx hash.
-  async _relayAuth(grantId, leg, authorization, signature) {
-    const resp = await fetch(this.relayerUrl.replace(/\/$/, '') + '/relay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ grantId, leg, authorization, signature }) });
-    const out = await resp.json().catch(() => ({}));
-    if (!out.ok || !out.txHash) throw new Error(`relayer rejected ${leg} leg: ${out.error || resp.status}`);
-    return out.txHash;
   }
   // Has this EIP-3009 nonce already been spent on-chain? (a prior, possibly-stranded attempt)
   async _authUsed(nonce) {
