@@ -337,6 +337,13 @@ export class Mtok {
     if (pinnedFee && String(config.feeAddress || '').toLowerCase() !== pinnedFee.toLowerCase()) {
       throw new Error(`fee_address_mismatch: /api/config returned ${config.feeAddress} for chain ${this.chainId} but the pinned platform fee address is ${pinnedFee}. Refusing to pay a possibly-tampered fee address.`);
     }
+    // #320: pin the fee RATE too, not just the address. The fee leg amount used to trust
+    // config.feeBps from the unauthenticated /api/config -- a tampered/compromised config could set
+    // feeBps huge and the buyer would sign a giant fee leg to the (correctly pinned) treasury (the
+    // platform verifies only a MINIMUM fee, so over-payment passes). On a pinned chain, use our
+    // expected feeBps and ignore the fetched rate; unknown chains fall back to config (same caveat
+    // as the address). This also keeps the fee bounded so it can't blow past totalNeedUsd.
+    const feeRateBps = pinnedFee ? feeBps : (Number(config.feeBps) || feeBps);
 
     // Estimate a draw's cost (USD) so we know when to top up. Use the offer's output
     // price against the request's max_tokens (a generous upper bound; actual metered
@@ -373,7 +380,7 @@ export class Mtok {
           nonce: '0x' + crypto.randomBytes(32).toString('hex'), offerId: offer.id, n: fundN,
         }));
         feeTxHash = await Promise.resolve(_signChunkAuth({
-          leg: 'fee', to: config.feeAddress, amountUsd: chunkUsd * (config.feeBps ?? feeBps) / 10000,
+          leg: 'fee', to: config.feeAddress, amountUsd: chunkUsd * feeRateBps / 10000,
           nonce: '0x' + crypto.randomBytes(32).toString('hex'), offerId: offer.id, n: fundN,
         }));
       } catch (e) {
@@ -431,7 +438,7 @@ export class Mtok {
         && completion
         && Array.isArray(completion.choices)
         && completion.choices.length > 0
-        && completion.choices[0]?.message?.content != null
+        && (completion.choices[0]?.message?.content ?? '').trim().length > 0 // #320: '' != null is true; an EMPTY completion is non-delivery -> dispute, don't affirm
         && completion.model === offer.model
         && completion.usage != null;
 
