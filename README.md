@@ -6,7 +6,7 @@ sign their own orders, and pay peer-to-peer on-chain. This SDK hides all of that
 
 > Status: reference implementation for the #74 relaunch. Validated against the staging
 > worker on Base Sepolia. The canonical-intent + leg-nonce encodings here must track the
-> server's `api/src/core/{signed-orders,settlement}.js`.
+> server's `packages/api/src/core/{signed-orders,settlement}.js`.
 
 ## Why it exists
 

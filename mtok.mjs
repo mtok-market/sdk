@@ -12,7 +12,7 @@
 //   const r = await mtok.drawFromSeller({ offer: routes[0], totalNeedUsd: 1, sellerId: routes[0].sellerId });
 //
 // Self-contained: node:crypto (order signing) + viem (EVM). The canonicalIntent +
-// legNonce below MUST match the server's api/src/core/{signed-orders,settlement}.js.
+// legNonce below MUST match the server's packages/api/src/core/{signed-orders,settlement}.js.
 import crypto from 'node:crypto';
 import { createWalletClient, createPublicClient, http, fallback, parseAbi } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -49,7 +49,7 @@ const TWA = parseAbi(['function transferWithAuthorization(address from,address t
 const META = parseAbi(['function authorizationState(address authorizer, bytes32 nonce) view returns (bool)', 'event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)']);
 // #64: canonical platform fee addresses, pinned per chain so a tampered /api/config
 // cannot redirect the fee leg. Public, stable platform treasury addresses (also in
-// site/static/llms.txt + the buying guide so non-SDK agents can pin them too).
+// apps/site/static/llms.txt + the buying guide so non-SDK agents can pin them too).
 export const PINNED_FEE_ADDRESSES = {
   8453: '0x6B5FED4aca54Ca89d95b822fD64c8545D34B673b',  // Base mainnet (mtok.market)
   84532: '0x25EFcbfD32C3f769690aA1181d48565f69c855E1', // Base Sepolia (staging/testnet)
@@ -265,7 +265,7 @@ export class Mtok {
   //     returns the confirmed txHash; default: real EIP-3009 via _buildAuth+_submitAuthSelf
   //   _stubApi — { reputation, affirm, dispute, config } — default: real platform API calls
   //
-  // CHUNK_FLOOR = 0.10 (matches DEFAULT_REP_KNOBS.chunkFloorUsd in api/src/core/reputation.js)
+  // CHUNK_FLOOR = 0.10 (matches DEFAULT_REP_KNOBS.chunkFloorUsd in packages/api/src/core/reputation.js)
   async drawFromSeller({
     offer,          // { id, tier, relayEndpoint, model, inputPricePerMTok, outputPricePerMTok, agentId, settlementPubkey }
     totalNeedUsd,   // HARD CAP on total USD to FUND across the run
@@ -363,7 +363,7 @@ export class Mtok {
     let activeBookingId = bookingId ?? null;
 
     // FUND one on-chain top-up: sign both legs, POST a FUND /chunk, update balance.
-    // Returns { ok, error? }. On a signer/relay/report failure, ok=false (caller disputes).
+    // Returns { ok, error? }. On a signer/packages/relay/report failure, ok=false (caller disputes).
     const doFund = async (targetUsd) => {
       const chunkUsd = fundN === 0
         ? Math.min(CHUNK_FLOOR, remainingBudget)
