@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { meterUsd, PINNED_FEE_ADDRESSES, requiresFeeLeg, round6Usd, usdToAtomic } from './protocol.mjs';
+import { configuredFeeUsd, meterUsd, PINNED_FEE_ADDRESSES, requiresFeeLeg, round6Usd, usdToAtomic } from './protocol.mjs';
 
 const CHUNK_FLOOR = 0.10; // must stay in sync with DEFAULT_REP_KNOBS.chunkFloorUsd
 const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
@@ -141,9 +141,7 @@ export async function drawFromSeller(client, {
       activeBookingId = activeBookingId ?? contractBookingId();
       const chunkUsd = Math.min(remainingBudget, Math.max(CHUNK_FLOOR, Math.min(est || CHUNK_FLOOR, recommendedMaxChunkUsd)));
       if (!(chunkUsd > 0.0001)) break;
-      const feeUsd = requiresFeeLeg({ amountUsd: chunkUsd, feeAddress: config.feeAddress, feeBps: feeRateBps, dustThresholdUsd })
-        ? round6Usd(chunkUsd * feeRateBps / 10000)
-        : 0;
+      const feeUsd = configuredFeeUsd({ amountUsd: chunkUsd, feeAddress: config.feeAddress, feeBps: feeRateBps });
       const usagePrice = (v) => usdToAtomic(v ?? 0);
       const payment = {
         buyerAgentId: client.agentId,

@@ -94,19 +94,19 @@ export class Mtok {
   // Post a SELLER-HOSTED (tier:direct) offer: the seller runs their own relay
   // (relayEndpoint, public HTTPS) and buyers prepay per chunk on-chain to
   // settlementPubkey (the seller's Base wallet). price is USD/MTok and must be
-  // > 0 — price-0 is banned (dust = gas-only/free, a real price above dust = paid).
+  // > 0 — price-0 is banned.
   // payoutAddress is REQUIRED by the non-custodial server (where buyers pay you); it
   // is signed INTO the intent params (the router rebuilds the order from intent.params).
   // For a direct offer it is the same wallet as settlementPubkey, so it defaults to it.
   async offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey, payoutAddress, usableForSeconds = 3600, recurring = false }) {
-    if (!(Number(price) > 0)) throw new Error('offer: price must be > 0 (price-0 is banned; use a tiny dust price for gas-only/free)');
+    if (!(Number(price) > 0)) throw new Error('offer: price must be > 0 (price-0 is banned)');
     const params = { inputTokens, outputTokens, inputPricePerMTok: price, outputPricePerMTok: price, tier: 'direct', relayEndpoint, settlementPubkey, payoutAddress: payoutAddress ?? settlementPubkey, usableForSeconds, recurring };
     const r = await this._req('POST', '/offers', this._sign('offer', model, params));
     if (r.status !== 201) throw new Error('offer failed: ' + JSON.stringify(r.body));
     return r.body.order;
   }
   async bid({ model, inputTokens, outputTokens, maxPrice }) {
-    if (!(Number(maxPrice) > 0)) throw new Error('bid: maxPrice must be > 0 (price-0 is banned; use a tiny dust price for gas-only/free)');
+    if (!(Number(maxPrice) > 0)) throw new Error('bid: maxPrice must be > 0 (price-0 is banned)');
     if (!this.account?.address) throw new Error('bid: no EVM account; call Mtok.create() or provide an account');
     const params = { inputTokens, outputTokens, maxInputPricePerMTok: maxPrice, maxOutputPricePerMTok: maxPrice, payerAddress: this.account.address };
     const r = await this._req('POST', '/bids', this._sign('bid', model, params));

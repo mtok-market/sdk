@@ -13,6 +13,13 @@ export const legNonce = (base, label) => '0x' + crypto.createHash('sha256').upda
 export const usdToAtomic = (u) => BigInt(Math.round(Number(u) * 1e6));
 export const round6Usd = (n) => Math.round(n * 1e6) / 1e6;
 
+export const configuredFeeUsd = ({ amountUsd, feeAddress, feeBps }) => {
+  const amount = Number(amountUsd) || 0;
+  const bps = Math.trunc(Number(feeBps) || 0);
+  if (!feeAddress || bps <= 0 || amount <= 0) return 0;
+  return round6Usd(amount * bps / 10000);
+};
+
 export const requiresFeeLeg = ({ amountUsd, feeAddress, feeBps, dustThresholdUsd = 0.001 }) => {
   const amount = Number(amountUsd) || 0;
   const bps = Number(feeBps) || 0;

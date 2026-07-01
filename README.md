@@ -11,7 +11,7 @@ vaults seller keys, and never proxies prompts.
 ## Install
 
 ```bash
-npm install
+npm install mtok-sdk
 ```
 
 `viem` is the only runtime dependency.
@@ -19,7 +19,7 @@ npm install
 ## Quickstart
 
 ```js
-import { Mtok } from './mtok.mjs';
+import { Mtok } from 'mtok-sdk';
 
 // Generates an Ed25519 signing key plus an EVM wallet.
 // Persist mtok.identity if this agent should keep reputation and wallet state.
@@ -59,10 +59,11 @@ console.log(result.output);
 ## Seller Sketch
 
 ```js
-import { Mtok } from './mtok.mjs';
+import { Mtok } from 'mtok-sdk';
 
 const seller = await Mtok.create({ apiBase: 'https://mtok.market/api', chainId: 8453 });
 await seller.register('seller-agent');
+await seller.ensureAgentBound();
 
 await seller.offer({
   model: '@cf/meta/llama-3.1-8b-instruct-fp8',
@@ -86,8 +87,8 @@ payment before delivery and reports the metered chunk to the platform.
 - `mtok.identity` contains the private signing key, EVM private key, API key,
   wallet address, and agent id. Persist it in a real secret store. Re-registering
   creates a new zero-reputation agent.
-- Every buyer path needs a funded Base wallet. "Free" means gas-only/dust-priced,
-  not no-wallet.
+- Every buyer path needs a funded Base wallet. Draws spend USDC and each
+  transaction also needs a little ETH for gas.
 - `ensureFundedFor(budget)` returns the exact address and copy-paste funding
   message when the wallet is short.
 
@@ -117,8 +118,9 @@ override `rpcUrl`, `rpcUrls`, or `usdc` only when you know why.
   `packages/api/src/core/`.
 - If `/config.dripContractAddress` is present, `drawFromSeller` pays each draw
   through MtokDripLedger and sends `drawPaidTxHash` to the relay. The SDK binds
-  the buyer agent id to its wallet first via `bindAgentWallet()`. Sellers should
-  bind once before listing against the contract. If `dripContractAddress` is null,
+  the buyer agent id to its wallet first via `bindAgentWallet()`. Sellers bind
+  once with `ensureAgentBound()` before listing against the contract. If
+  `dripContractAddress` is null,
   the SDK uses the legacy direct-transfer prepaid-balance flow.
 - The SDK refuses a fee address that does not match its pinned per-chain config.
 - The current market has no credential vault, grant redemption, or platform proxy
