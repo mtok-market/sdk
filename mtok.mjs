@@ -17,7 +17,7 @@ import crypto from 'node:crypto';
 import { createWalletClient, createPublicClient, http, fallback } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { baseSepolia, base } from 'viem/chains';
-import { DRIP_LEDGER, ERC20, META, signIntent, TWA } from './src/protocol.mjs';
+import { DRIP_LEDGER, DRAW_STATUS, ERC20, signIntent, TWA } from './src/protocol.mjs';
 export { PINNED_FEE_ADDRESSES } from './src/protocol.mjs';
 import { ensureFundedFor as ensureFundedForClient, walletBalances } from './src/funding.mjs';
 import { buy as buyClient, drawFromSeller as drawFromSellerClient } from './src/draw.mjs';
@@ -154,20 +154,17 @@ export class Mtok {
     const r = signature.slice(0, 66), s = '0x' + signature.slice(66, 130), v = parseInt(signature.slice(130, 132), 16);
     return this._confirm(await this._write({ address: this.usdc, abi: TWA, functionName: 'transferWithAuthorization', args: [a.from, a.to, BigInt(a.value), BigInt(a.validAfter), BigInt(a.validBefore), a.nonce, v, r, s] }));
   }
-  // Has this EIP-3009 nonce already been spent on-chain? (a prior, possibly-stranded attempt)
-  async _authUsed(nonce) {
-    try { return await this.pub.readContract({ address: this.usdc, abi: META, functionName: 'authorizationState', args: [this.account.address, nonce] }); } catch { return false; }
-  }
-  // Recover the tx hash of an already-spent authorization by its nonce, so a half-paid
-  // grant can be redeemed on retry instead of re-submitting (which would revert/reject).
-  async _findAuthTx(nonce) {
+  // Contract-mode replay guard: read the on-chain DrawStatus for a drawId. A payDraw is
+  // idempotent by drawId (payDraw reverts DrawAlreadyExists once status != None), so before
+  // re-submitting on a retry we check whether this exact draw already landed — a prior
+  // attempt could have paid but stranded before we recorded the hash (mtok-market#128).
+  // Returns one of DRAW_STATUS (None=unpaid, Paid, Affirmed, Disputed). Reads fail-open to
+  // None so a flaky RPC never blocks a genuine first payment.
+  async _drawStatus(contractAddress, drawId) {
     try {
-      const latest = await this.pub.getBlockNumber();
-      // ~1h of Base 2s blocks; EIP-3009 auths expire in 1h so the tx is within this window,
-      // and the range stays small enough for public RPCs that cap getLogs spans.
-      const logs = await this.pub.getLogs({ address: this.usdc, event: META[1], args: { authorizer: this.account.address, nonce }, fromBlock: latest > 2000n ? latest - 2000n : 0n, toBlock: 'latest' });
-      return logs.length ? logs[logs.length - 1].transactionHash : null;
-    } catch { return null; }
+      const rec = await this.pub.readContract({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'draws', args: [drawId] });
+      return Number(rec?.[5] ?? DRAW_STATUS.None);
+    } catch { return DRAW_STATUS.None; }
   }
 
   async _payDraw(contractAddress, payment) {

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
-import { configuredFeeUsd, meterUsd, PINNED_FEE_ADDRESSES, requiresFeeLeg, round6Usd, usdToAtomic } from './protocol.mjs';
+import { configuredFeeUsd, DRAW_STATUS, meterUsd, PINNED_FEE_ADDRESSES, requiresFeeLeg, round6Usd, usdToAtomic } from './protocol.mjs';
+import { CHUNK_FLOOR, DEFAULT_FEE_BPS } from './constants.mjs';
 
-const CHUNK_FLOOR = 0.10; // must stay in sync with DEFAULT_REP_KNOBS.chunkFloorUsd
 const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
 const contractBookingId = () => 'bkgc_' + crypto.randomBytes(12).toString('base64url').replace(/[^a-zA-Z0-9_-]/g, '');
 
@@ -14,7 +14,7 @@ export async function drawFromSeller(client, {
   requests,
   relayFetch,
   signChunkAuth,
-  feeBps = 250,
+  feeBps = DEFAULT_FEE_BPS,
 } = {}) {
   const _relayFetch = relayFetch ?? client.relayFetch ?? (async (params) => {
     const url = offer.relayEndpoint.replace(/\/$/, '') + '/chunk';
@@ -65,6 +65,7 @@ export async function drawFromSeller(client, {
   const _drawIdFor = client.drawIdFor ?? client._drawIdFor?.bind(client);
   const _affirmDraw = client.affirmDraw ?? client._affirmDraw?.bind(client);
   const _disputeDraw = client.disputeDraw ?? client._disputeDraw?.bind(client);
+  const _drawStatus = client.drawStatus ?? client._drawStatus?.bind(client);
   const _ensureAgentBound = client.pub ? client.ensureAgentBound?.bind(client) : null;
 
   const outPrice = Number(offer.outputPricePerMTok) || 0;
@@ -158,10 +159,39 @@ export async function drawFromSeller(client, {
         deadline: BigInt(Math.floor(Date.now() / 1000) + 3600),
       };
 
-      let drawPaidTxHash, drawId, completion, drawError;
+      let drawPaidTxHash, drawId, completion, drawError, replayed = false, priorStatus;
       try {
         drawId = await _drawIdFor(dripContractAddress, payment);
-        drawPaidTxHash = await _payDraw(dripContractAddress, payment);
+        // Double-spend protection lives ON-CHAIN: payDraw reverts with DrawAlreadyExists once a
+        // draw for this bookingId+n exists, so money physically cannot move twice. We do NOT read
+        // status before paying — that would cost an extra RPC on every happy-path draw. Pay
+        // directly; the revert is the guard.
+        //
+        // The recovery below is ADVISORY convenience only (mtok-market#128): if a prior attempt
+        // paid but stranded before we recorded the hash, the retry's payDraw reverts DrawAlreadyExists.
+        // Rather than surface a raw failed transaction, we read status to confirm the draw really
+        // exists and hand the agent a clean `replay: true` signal. An agent rolling their own buyer
+        // can skip all of this and just rely on the on-chain revert. See packages/api/src/core/guides.js
+        // for the fuller rationale.
+        try {
+          drawPaidTxHash = await _payDraw(dripContractAddress, payment);
+        } catch (payErr) {
+          if (_drawStatus && /DrawAlreadyExists|already exists/i.test(payErr?.message ?? '')) {
+            priorStatus = await _drawStatus(dripContractAddress, drawId);
+            // Status None means the revert was NOT actually a replay — a real failure. Rethrow.
+            if (priorStatus === DRAW_STATUS.None) throw payErr;
+            replayed = true;
+          } else {
+            throw payErr;
+          }
+        }
+        if (replayed) {
+          // The draw already exists on-chain (and may already have delivered). Do NOT pay again,
+          // do NOT dispute a possibly-good draw, and do NOT re-fetch. Hand control back with a
+          // clear replay signal instead of guessing whether the earlier attempt delivered.
+          chunks.push({ kind: 'draw', n: drawN, drawId, replay: true, priorStatus, completion: null, usedUsd: 0, remainingUsd });
+          return { output: outputParts.join(''), chunks, drawnUsd, fundedUsd, disputed: false, affirmed: false, replay: true };
+        }
         completion = await _relayFetch({ bookingId: activeBookingId, n: drawN, drawPaidTxHash, model: offer.model, buyerId: client.agentId, request: reqItem });
       } catch (e) {
         drawError = e;
@@ -186,11 +216,20 @@ export async function drawFromSeller(client, {
         return { output: outputParts.join(''), chunks, drawnUsd, fundedUsd, disputed: true, affirmed: false };
       }
 
+      // Over-affirm guard: never affirm more delivered value than was paid for this draw.
+      // The contract also enforces this, but catching it SDK-side avoids burning gas on a
+      // guaranteed revert and surfaces a clear error.
+      const deliveredUsdAtomic = usdToAtomic(usedThisDraw);
+      if (deliveredUsdAtomic > BigInt(payment.sellerUsdAtomic)) {
+        throw new Error(`over_affirm: deliveredUsdAtomic ${deliveredUsdAtomic} exceeds paid sellerUsdAtomic ${payment.sellerUsdAtomic} for draw ${drawId}`);
+      }
       const responseHash = hash32(completion);
+      // Reaching here means we paid this draw fresh in this call (a replay returns early above),
+      // so the draw is Paid-and-open and affirm always proceeds — no prior-status skip needed.
       const affirmTxHash = await _affirmDraw(dripContractAddress, drawId, {
         inputTokens,
         outputTokens,
-        deliveredUsdAtomic: usdToAtomic(usedThisDraw),
+        deliveredUsdAtomic,
         responseHash,
       });
       remainingUsd = Number(completion.remainingUsd) || 0;

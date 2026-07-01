@@ -1,4 +1,5 @@
 import { ERC20, ETH_GAS_RESERVE, round6Usd } from './protocol.mjs';
+import { DEFAULT_FEE_BPS } from './constants.mjs';
 
 export async function walletBalances(client) {
   const [usdc, eth] = await Promise.all([
@@ -8,7 +9,7 @@ export async function walletBalances(client) {
   return { usdc, eth };
 }
 
-export async function ensureFundedFor(client, budget, { feeBps = 250 } = {}) {
+export async function ensureFundedFor(client, budget, { feeBps = DEFAULT_FEE_BPS } = {}) {
   const usdcNeed = round6Usd(Number(budget) * (1 + (Number(feeBps) || 0) / 10000));
   const ethNeed = ETH_GAS_RESERVE;
   const bal = await client._walletBalances();

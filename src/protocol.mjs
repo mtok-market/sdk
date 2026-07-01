@@ -38,7 +38,6 @@ export const ERC20 = parseAbi([
   'function version() view returns (string)',
 ]);
 export const TWA = parseAbi(['function transferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce,uint8 v,bytes32 r,bytes32 s)']);
-export const META = parseAbi(['function authorizationState(address authorizer, bytes32 nonce) view returns (bool)', 'event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)']);
 export const DRIP_LEDGER = parseAbi([
   'function agentKeyFor(string agentId) view returns (bytes32)',
   'function agentWallet(bytes32 agentKey) view returns (address)',
@@ -48,7 +47,13 @@ export const DRIP_LEDGER = parseAbi([
   'function drawIdFor((string buyerAgentId,string sellerAgentId,string bookingId,string offerId,string model,uint32 n,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint256 inputPricePerMTokAtomic,uint256 outputPricePerMTokAtomic,bytes32 requestHash,uint256 deadline)) view returns (bytes32)',
   'function affirmDraw(bytes32 drawId,uint256 inputTokens,uint256 outputTokens,uint256 deliveredUsdAtomic,bytes32 responseHash)',
   'function disputeDraw(bytes32 drawId,bytes32 reasonHash)',
+  // public `draws` mapping auto-getter: returns the DrawRecord tuple. `status` is the
+  // idempotency signal for the contract-mode replay guard (mtok-market#128).
+  'function draws(bytes32 drawId) view returns (bytes32 buyerAgentKey,bytes32 sellerAgentKey,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint64 paidAt,uint8 status)',
 ]);
+
+// DrawStatus enum in MtokDripLedger.sol (order is load-bearing — matches the on-chain enum).
+export const DRAW_STATUS = { None: 0, Paid: 1, Affirmed: 2, Disputed: 3 };
 
 export const PINNED_FEE_ADDRESSES = {
   8453: '0x6B5FED4aca54Ca89d95b822fD64c8545D34B673b',
