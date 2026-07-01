@@ -11,49 +11,16 @@
 //   const { routes } = await mtok.bid({ model: 'gpt-5.2', inputTokens: 200_000, outputTokens: 200_000, maxPrice: 0.5 });
 //   const r = await mtok.drawFromSeller({ offer: routes[0], totalNeedUsd: 1, sellerId: routes[0].sellerId });
 //
-// Self-contained: node:crypto (order signing) + viem (EVM). The canonicalIntent +
-// legNonce below MUST match the server's packages/api/src/core/{signed-orders,settlement}.js.
+// Source is split for maintainability; build:sdk bundles it back into one
+// downloadable sdk.mjs for agents that want a single file.
 import crypto from 'node:crypto';
-import { createWalletClient, createPublicClient, http, fallback, parseAbi } from 'viem';
+import { createWalletClient, createPublicClient, http, fallback } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { baseSepolia, base } from 'viem/chains';
-
-// ---- canonical encoding (must match signed-orders.js) ----
-function stable(v) {
-  if (Array.isArray(v)) return v.map(stable);
-  if (v && typeof v === 'object') return Object.keys(v).sort().reduce((o, k) => ((o[k] = stable(v[k])), o), {});
-  return v;
-}
-const canonicalIntent = (intent) => JSON.stringify(stable(intent));
-const signIntent = (intent, privKey) => crypto.sign(null, Buffer.from(canonicalIntent(intent)), privKey).toString('base64url');
-// per-leg settlement nonce (must match settlement.js legNonce)
-const legNonce = (base, label) => '0x' + crypto.createHash('sha256').update(Buffer.from(String(base).replace(/^0x/, ''), 'hex')).update(String(label)).digest('hex');
-const usdToAtomic = (u) => BigInt(Math.round(Number(u) * 1e6));
-const requiresFeeLeg = ({ amountUsd, feeAddress, feeBps, dustThresholdUsd = 0.001 }) => {
-  const amount = Number(amountUsd) || 0;
-  const bps = Number(feeBps) || 0;
-  const dust = Number(dustThresholdUsd) || 0.001;
-  return Boolean(feeAddress) && bps > 0 && amount >= dust && amount * bps / 10000 > 0;
-};
-const ETH_GAS_RESERVE = 0.0005; // ~enough native gas for several Base txns
-
-const ERC20 = parseAbi([
-  'function transfer(address,uint256) returns (bool)',
-  'function approve(address,uint256) returns (bool)',
-  'function allowance(address,address) view returns (uint256)',
-  'function balanceOf(address) view returns (uint256)',
-  'function name() view returns (string)',
-  'function version() view returns (string)',
-]);
-const TWA = parseAbi(['function transferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce,uint8 v,bytes32 r,bytes32 s)']);
-const META = parseAbi(['function authorizationState(address authorizer, bytes32 nonce) view returns (bool)', 'event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)']);
-// #64: canonical platform fee addresses, pinned per chain so a tampered /api/config
-// cannot redirect the fee leg. Public, stable platform treasury addresses (also in
-// apps/site/static/llms.txt + the buying guide so non-SDK agents can pin them too).
-export const PINNED_FEE_ADDRESSES = {
-  8453: '0x6B5FED4aca54Ca89d95b822fD64c8545D34B673b',  // Base mainnet (mtok.market)
-  84532: '0x25EFcbfD32C3f769690aA1181d48565f69c855E1', // Base Sepolia (staging/testnet)
-};
+import { DRIP_LEDGER, ERC20, META, signIntent, TWA } from './src/protocol.mjs';
+export { PINNED_FEE_ADDRESSES } from './src/protocol.mjs';
+import { ensureFundedFor as ensureFundedForClient, walletBalances } from './src/funding.mjs';
+import { buy as buyClient, drawFromSeller as drawFromSellerClient } from './src/draw.mjs';
 
 export class Mtok {
   constructor(cfg) { Object.assign(this, cfg); }
@@ -62,7 +29,7 @@ export class Mtok {
   // `mtok.identity` (the two private keys + apiKey) to reuse the same agent.
   static async create({
     apiBase = 'https://mtok.market/api',
-    chainId = 84532,                                  // 84532 Base Sepolia | 8453 Base mainnet
+    chainId = 8453,                                   // 8453 Base mainnet | 84532 Base Sepolia
     rpcUrl,                                            // single RPC override (back-compat)
     rpcUrls,                                           // OR a list → viem fallback (resilient)
     usdc = chainId === 8453 ? '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' : '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
@@ -138,7 +105,9 @@ export class Mtok {
     if (r.status !== 201) throw new Error('offer failed: ' + JSON.stringify(r.body));
     return r.body.order;
   }
-  async bid({ model, inputTokens, outputTokens, maxPrice = 0 }) {
+  async bid({ model, inputTokens, outputTokens, maxPrice }) {
+    if (!(Number(maxPrice) > 0)) throw new Error('bid: maxPrice must be > 0 (price-0 is banned; use a tiny dust price for gas-only/free)');
+    if (!this.account?.address) throw new Error('bid: no EVM account; call Mtok.create() or provide an account');
     const params = { inputTokens, outputTokens, maxInputPricePerMTok: maxPrice, maxOutputPricePerMTok: maxPrice, payerAddress: this.account.address };
     const r = await this._req('POST', '/bids', this._sign('bid', model, params));
     if (r.status !== 201) throw new Error('bid failed: ' + JSON.stringify(r.body));
@@ -201,267 +170,57 @@ export class Mtok {
     } catch { return null; }
   }
 
-  // ---- buyer fund-relay (self-fund / "option B") ----
-  // Read the buyer wallet's on-chain USDC + ETH balances. Returns atomic bigints.
-  async _walletBalances() {
-    const [usdc, eth] = await Promise.all([
-      this.pub.readContract({ address: this.usdc, abi: ERC20, functionName: 'balanceOf', args: [this.account.address] }),
-      this.pub.getBalance({ address: this.account.address }),
-    ]);
-    return { usdc, eth };
+  async _payDraw(contractAddress, payment) {
+    const total = BigInt(payment.sellerUsdAtomic) + BigInt(payment.feeUsdAtomic || 0n);
+    await this._approveAndWait(contractAddress, total);
+    return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'payDraw', args: [payment] }));
   }
-
-  // The one human step: fund the buyer wallet. Reads on-chain balances and returns a
-  // structured ask the agent both acts on and relays to its human verbatim. usdc need =
-  // budget + the platform fee leg (feeBps); eth need = a small gas reserve. Estimates;
-  // documented in the buying guide.
-  async ensureFundedFor(budget, { feeBps = 250 } = {}) {
-    const usdcNeed = round6Usd(Number(budget) * (1 + (Number(feeBps) || 0) / 10000));
-    const ethNeed = ETH_GAS_RESERVE;
-    const bal = await this._walletBalances();
-    const haveUsdc = Number(bal.usdc) / 1e6;
-    const haveEth = Number(bal.eth) / 1e18;
-    const shortUsdc = round6Usd(Math.max(0, usdcNeed - haveUsdc));
-    const shortEth = Math.max(0, ethNeed - haveEth);
-    const ok = shortUsdc <= 0 && shortEth <= 1e-9; // sub-gwei float dust counts as funded
-    const address = this.account.address;
-    const explorerBase = this.chainId === 8453 ? 'https://basescan.org' : 'https://sepolia.basescan.org';
-    const message = ok ? null
-      : `Send ${shortUsdc} USDC + ~${shortEth.toFixed(4)} ETH to ${address} on Base (chain ${this.chainId}).`;
-    return {
-      ok, address, chainId: this.chainId,
-      need: { usdc: usdcNeed, eth: ethNeed },
-      have: { usdc: round6Usd(haveUsdc), eth: haveEth },
-      shortfall: { usdc: shortUsdc, eth: shortEth },
-      message, explorerUrl: `${explorerBase}/address/${address}`,
-    };
-  }
-
-  // ---- direct-tier buyer: prepaid-balance draws from a seller's relay (#129) ----
-  //
-  // The booking is a STANDING PREPAID BALANCE. The flow is fund-then-draw:
-  //   • FUND (on-chain): pay the seller's settlement address + the fee leg, prove it
-  //     on-chain, and POST a FUND /chunk. This ADDS to the booking balance (paidUsd).
-  //     One payment funds many draws; gas is amortized. Validation-first sizing:
-  //       fund 0: min(CHUNK_FLOOR, totalNeedUsd) — tiny first top-up regardless of rep
-  //       fund N>0: min(remaining budget, recommendedMaxChunkUsd) — scale toward rep cap
-  //   • DRAW (off-chain): POST a DRAW /chunk with { bookingId, request }. The relay
-  //     meters ACTUAL usage and deducts it (usedUsd); the response carries the new
-  //     remainingUsd. The buyer pays only for what it uses.
-  // Before each request we ensure remainingUsd covers an estimate; if not (and budget
-  // remains) we FUND first. totalNeedUsd is the HARD CAP on funding — the buyer's max
-  // loss is the funded balance, which stays small.
-  //
-  // On a bad/missing completion (wrong model / empty choices / missing usage / relay
-  // error / signer error): DISPUTE + stop. On all requests delivered: AFFIRM.
-  //
-  // Settlement model (#114): the BUYER submits each FUND's EIP-3009
-  // transferWithAuthorization via their own wallet and gets back a CONFIRMED txHash;
-  // the relay only VERIFIES those tx hashes on-chain (read-only). DRAWs carry no payment.
-  //
-  // Injectables (for testing without network/chain):
-  //   relayFetch(params) — async fn that POSTs to the relay; default: real fetch
-  //   signChunkAuth(params) — async fn that signs+submits a FUND payment leg and
-  //     returns the confirmed txHash; default: real EIP-3009 via _buildAuth+_submitAuthSelf
-  //   _stubApi — { reputation, affirm, dispute, config } — default: real platform API calls
-  //
-  // CHUNK_FLOOR = 0.10 (matches DEFAULT_REP_KNOBS.chunkFloorUsd in packages/api/src/core/reputation.js)
-  async drawFromSeller({
-    offer,          // { id, tier, relayEndpoint, model, inputPricePerMTok, outputPricePerMTok, agentId, settlementPubkey }
-    totalNeedUsd,   // HARD CAP on total USD to FUND across the run
-    sellerId,       // seller's agentId (for reputation lookup)
-    bookingId,      // existing booking id to reuse (optional; else established by first FUND)
-    request,        // a single inference request, OR pass `requests` for several
-    requests,       // optional array of inference requests to deliver, each a DRAW
-    relayFetch,     // injectable relay POST fn; default: this.relayFetch or real fetch
-    signChunkAuth,  // injectable signer; default: this.signChunkAuth or real EIP-3009
-    feeBps = 250,   // platform fee in basis points (must stay in sync with server-side default)
-  } = {}) {
-    const CHUNK_FLOOR = 0.10; // must stay in sync with DEFAULT_REP_KNOBS.chunkFloorUsd
-
-    // Resolve injectables — prefer call-site overrides, then instance-level overrides, then real defaults.
-    const _relayFetch = relayFetch ?? this.relayFetch ?? (async (params) => {
-      const url = offer.relayEndpoint.replace(/\/$/, '') + '/chunk';
-      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(params) });
-      return r.json();
+  async bindAgentWallet({ contractAddress, deadline } = {}) {
+    const target = contractAddress ?? (await this._req('GET', '/config', null, false)).body?.dripContractAddress;
+    if (!target) throw new Error('bindAgentWallet: no dripContractAddress configured');
+    if (!this.agentId || !this.apiKey) throw new Error('bindAgentWallet: register first');
+    const agentKey = await this.pub.readContract({ address: target, abi: DRIP_LEDGER, functionName: 'agentKeyFor', args: [this.agentId] });
+    const nonce = await this.pub.readContract({ address: target, abi: DRIP_LEDGER, functionName: 'bindNonces', args: [agentKey] });
+    const r = await this._req('POST', '/agents/bind-wallet', {
+      wallet: this.account.address,
+      contractAddress: target,
+      nonce: nonce.toString(),
+      deadline: String(deadline ?? Math.floor(Date.now() / 1000) + 3600),
     });
-
-    // Default signer: build the EIP-3009 authorization AND submit it from the buyer's
-    // wallet (we pay the gas), returning the CONFIRMED txHash the relay will verify.
-    const _signChunkAuth = signChunkAuth ?? this.signChunkAuth ?? (async (params) => {
-      if (!this.account) throw new Error('drawFromSeller: no EVM account; pass signChunkAuth or call Mtok.create()');
-      const built = await this._buildAuth(params.to, usdToAtomic(params.amountUsd), params.nonce);
-      return this._submitAuthSelf(built);
+    if (r.status !== 200) throw new Error('bindAgentWallet failed: ' + JSON.stringify(r.body));
+    const b = r.body.binding;
+    const hash = await this._write({
+      address: target,
+      abi: DRIP_LEDGER,
+      functionName: 'bindAgent',
+      args: [b.agentId, b.wallet, BigInt(b.deadline), b.signature],
     });
-
-    const _api = this._stubApi ?? {
-      reputation: async (sid) => {
-        const r = await this._req('GET', `/agents/${encodeURIComponent(sid)}/reputation`);
-        if (r.status !== 200) throw new Error('reputation lookup failed: ' + JSON.stringify(r.body));
-        return r.body.reputation ?? r.body;
-      },
-      affirm: async (id) => {
-        const r = await this._req('POST', `/bookings/${encodeURIComponent(id)}/affirm`, {});
-        if (r.status !== 200 && r.status !== 204) throw new Error('affirm failed: ' + JSON.stringify(r.body));
-      },
-      dispute: async (id) => {
-        const r = await this._req('POST', `/bookings/${encodeURIComponent(id)}/dispute`, {});
-        if (r.status !== 200 && r.status !== 204) throw new Error('dispute failed: ' + JSON.stringify(r.body));
-      },
-      config: async () => {
-        const r = await this._req('GET', '/config', null, false);
-        if (r.status !== 200) throw new Error('config fetch failed: ' + JSON.stringify(r.body));
-        return r.body;
-      },
-    };
-
-    // The requests to deliver (each a DRAW). `requests` wins; else a single `request`;
-    // else a single null request (lets a caller fund+probe without a payload).
-    const reqList = Array.isArray(requests) && requests.length ? requests : [request ?? null];
-
-    // 1. Fetch seller reputation and platform config (once, before the loop).
-    const rep = await _api.reputation(sellerId);
-    const recommendedMaxChunkUsd = rep.recommendedMaxChunkUsd ?? CHUNK_FLOOR;
-    const config = await _api.config();
-    // #64: the platform fee address is a fixed per-chain constant. PIN it and refuse a
-    // /api/config that disagrees, so a tampered or MITM'd config cannot redirect the
-    // buyer's 2.5% fee leg to an attacker. (The platform also verifies the fee leg
-    // server-side against its own address, so a mismatch would fail the trade anyway;
-    // this stops the buyer paying the wrong address in the first place.) Unknown chains
-    // have no pin and fall back to the fetched value.
-    const pinnedFee = PINNED_FEE_ADDRESSES[this.chainId];
-    if (pinnedFee && String(config.feeAddress || '').toLowerCase() !== pinnedFee.toLowerCase()) {
-      throw new Error(`fee_address_mismatch: /api/config returned ${config.feeAddress} for chain ${this.chainId} but the pinned platform fee address is ${pinnedFee}. Refusing to pay a possibly-tampered fee address.`);
-    }
-    // #320: pin the fee RATE too, not just the address. The fee leg amount used to trust
-    // config.feeBps from the unauthenticated /api/config -- a tampered/compromised config could set
-    // feeBps huge and the buyer would sign a giant fee leg to the (correctly pinned) treasury (the
-    // platform verifies only a MINIMUM fee, so over-payment passes). On a pinned chain, use our
-    // expected feeBps and ignore the fetched rate; unknown chains fall back to config (same caveat
-    // as the address). This also keeps the fee bounded so it can't blow past totalNeedUsd.
-    const feeRateBps = pinnedFee ? feeBps : (Number(config.feeBps) || feeBps);
-    const dustThresholdUsd = Number(config.dustThresholdUsd) || 0.001;
-
-    // Estimate a draw's cost (USD) so we know when to top up. Use the offer's output
-    // price against the request's max_tokens (a generous upper bound; actual metered
-    // usage is what gets deducted). Falls back to the floor when no hint is available.
-    const outPrice = Number(offer.outputPricePerMTok) || 0;
-    const estimateCost = (r) => {
-      const maxOut = Number(r?.max_tokens) || 0;
-      if (outPrice > 0 && maxOut > 0) return (maxOut / 1e6) * outPrice;
-      return CHUNK_FLOOR; // unknown size → assume a floor-sized draw
-    };
-
-    let remainingBudget = totalNeedUsd;      // funding budget left (hard cap)
-    let remainingUsd = 0;                     // current booking balance (off-chain)
-    let fundN = 0;                            // FUND chunk counter (sizing + idempotency n)
-    let drawN = 0;                            // DRAW counter (idempotency n)
-    let fundedUsd = 0;                        // total on-chain funded (chunk USD)
-    let drawnUsd = 0;                         // total metered usage actually drawn
-    const chunks = [];
-    const outputParts = [];
-    let activeBookingId = bookingId ?? null;
-
-    // FUND one on-chain top-up: sign both legs, POST a FUND /chunk, update balance.
-    // Returns { ok, error? }. On a signer/packages/relay/report failure, ok=false (caller disputes).
-    const doFund = async (targetUsd) => {
-      const chunkUsd = fundN === 0
-        ? Math.min(CHUNK_FLOOR, remainingBudget)
-        : Math.min(remainingBudget, Math.max(targetUsd, recommendedMaxChunkUsd));
-      if (!(chunkUsd > 0.0001)) return { ok: false, error: new Error('funding budget exhausted; cannot top up') };
-
-      let sellerTxHash, feeTxHash;
-      try {
-        sellerTxHash = await Promise.resolve(_signChunkAuth({
-          leg: 'seller', to: offer.settlementPubkey, amountUsd: chunkUsd,
-          nonce: '0x' + crypto.randomBytes(32).toString('hex'), offerId: offer.id, n: fundN,
-        }));
-        if (requiresFeeLeg({ amountUsd: chunkUsd, feeAddress: config.feeAddress, feeBps: feeRateBps, dustThresholdUsd })) {
-          feeTxHash = await Promise.resolve(_signChunkAuth({
-            leg: 'fee', to: config.feeAddress, amountUsd: chunkUsd * feeRateBps / 10000,
-            nonce: '0x' + crypto.randomBytes(32).toString('hex'), offerId: offer.id, n: fundN,
-          }));
-        }
-      } catch (e) {
-        return { ok: false, error: e };
-      }
-
-      let booking;
-      try {
-        booking = await _relayFetch({
-          bookingId: activeBookingId, n: fundN, sellerTxHash, feeTxHash,
-          priceUsd: chunkUsd, model: offer.model, buyerId: this.agentId,
-        });
-      } catch (e) {
-        return { ok: false, error: e };
-      }
-      if (!booking || booking.error || booking.remainingUsd == null) {
-        return { ok: false, error: new Error('FUND failed: ' + JSON.stringify(booking ?? null)) };
-      }
-
-      activeBookingId = activeBookingId ?? booking._bookingId ?? null;
-      remainingUsd = Number(booking.remainingUsd) || 0;
-      fundedUsd += chunkUsd;
-      remainingBudget -= chunkUsd;
-      chunks.push({ kind: 'fund', n: fundN, usd: chunkUsd, remainingUsd, sellerTxHash, feeTxHash });
-      fundN++;
-      return { ok: true };
-    };
-
-    // 2. Deliver each request, funding first whenever the balance is short.
-    for (const reqItem of reqList) {
-      const est = estimateCost(reqItem);
-
-      // Ensure the balance can fund this draw; top up if short and budget remains.
-      while (remainingUsd < est && remainingBudget > 0.0001) {
-        const f = await doFund(est);
-        if (!f.ok) {
-          if (activeBookingId) await _api.dispute(activeBookingId).catch(() => {});
-          return { output: outputParts.join(''), chunks, drawnUsd, fundedUsd, disputed: true, affirmed: false };
-        }
-      }
-
-      // If we still can't fund a draw (budget cap hit), stop cleanly: affirm what we got.
-      if (remainingUsd <= 1e-6) break;
-
-      // DRAW: no payment, just the booking + the request. The relay meters actual
-      // usage and returns the post-draw remainingUsd.
-      let completion, drawError;
-      try {
-        completion = await _relayFetch({ bookingId: activeBookingId, n: drawN, model: offer.model, buyerId: this.agentId, request: reqItem });
-      } catch (e) {
-        drawError = e;
-      }
-
-      const isGood = !drawError
-        && completion
-        && Array.isArray(completion.choices)
-        && completion.choices.length > 0
-        && (completion.choices[0]?.message?.content ?? '').trim().length > 0 // #320: '' != null is true; an EMPTY completion is non-delivery -> dispute, don't affirm
-        && completion.model === offer.model
-        && completion.usage != null;
-
-      const usedThisDraw = isGood ? round6Usd(meterUsd(completion.usage, offer)) : 0;
-      chunks.push({ kind: 'draw', n: drawN, completion: isGood ? completion : null, usedUsd: usedThisDraw, remainingUsd: completion?.remainingUsd ?? remainingUsd, error: drawError?.message ?? completion?.error ?? null });
-
-      if (!isGood) {
-        // Bad draw — dispute and stop. Max loss = the funded balance (kept small).
-        if (activeBookingId) await _api.dispute(activeBookingId).catch(() => {});
-        return { output: outputParts.join(''), chunks, drawnUsd, fundedUsd, disputed: true, affirmed: false };
-      }
-
-      activeBookingId = activeBookingId ?? completion._bookingId ?? null;
-      if (completion.remainingUsd != null) remainingUsd = Number(completion.remainingUsd) || 0;
-      else remainingUsd = Math.max(0, remainingUsd - usedThisDraw);
-      drawnUsd += usedThisDraw;
-      outputParts.push(completion.choices[0].message.content ?? '');
-      drawN++;
-    }
-
-    // 3. All requests delivered — affirm and return the summary.
-    if (activeBookingId) await _api.affirm(activeBookingId).catch(() => {});
-    return { output: outputParts.join(''), chunks, drawnUsd, fundedUsd, disputed: false, affirmed: true };
+    return this._confirm(hash);
   }
+  async ensureAgentBound({ contractAddress } = {}) {
+    const target = contractAddress ?? (await this._req('GET', '/config', null, false)).body?.dripContractAddress;
+    if (!target) throw new Error('ensureAgentBound: no dripContractAddress configured');
+    if (!this.agentId) throw new Error('ensureAgentBound: register first');
+    const agentKey = await this.pub.readContract({ address: target, abi: DRIP_LEDGER, functionName: 'agentKeyFor', args: [this.agentId] });
+    const bound = await this.pub.readContract({ address: target, abi: DRIP_LEDGER, functionName: 'agentWallet', args: [agentKey] });
+    if (String(bound).toLowerCase() === String(this.account.address).toLowerCase()) return null;
+    return this.bindAgentWallet({ contractAddress: target });
+  }
+  async _drawIdFor(contractAddress, payment) {
+    return this.pub.readContract({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'drawIdFor', args: [payment] });
+  }
+  async _affirmDraw(contractAddress, drawId, { inputTokens, outputTokens, deliveredUsdAtomic, responseHash }) {
+    return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'affirmDraw', args: [drawId, BigInt(inputTokens), BigInt(outputTokens), BigInt(deliveredUsdAtomic), responseHash] }));
+  }
+  async _disputeDraw(contractAddress, drawId, reasonHash) {
+    return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'disputeDraw', args: [drawId, reasonHash] }));
+  }
+
+  async _walletBalances() { return walletBalances(this); }
+
+  async ensureFundedFor(budget, opts = {}) { return ensureFundedForClient(this, budget, opts); }
+
+  async drawFromSeller(opts = {}) { return drawFromSellerClient(this, opts); }
 
   // Send structured feedback (write-only telemetry; NEVER affects your reputation).
   // payload: { phase, ok, code?, expected?, note?, role?, ref?, sdk? }
@@ -470,62 +229,8 @@ export class Mtok {
     return r.body;
   }
 
-  // One-call buyer convenience over the explicit steps. Discovers via the book (a free
-  // read), gates on funding, then tries crossing tier:direct offers cheapest-first,
-  // drawing against each via drawFromSeller (which funds the floor first, tops up toward
-  // the seller's recommendedMaxChunkUsd within budget, meters usage, and affirms/disputes).
-  // Returns a STATUS OBJECT (never throws on an expected outcome) so an agent can branch
-  // without try/catch: { status: 'ok' | 'funding_required' | 'no_offers' | 'all_disputed' }.
-  //   buy({ model, budget, prompt | messages | requests, maxPrice?, sellerId? })
-  //   budget is the hard funding cap (== drawFromSeller totalNeedUsd) and your max loss.
-  async buy({ model, budget, prompt, messages, requests, maxPrice = 0, sellerId } = {}) {
-    if (!model || !(Number(budget) > 0)) throw new Error('buy: model and a positive budget are required');
-    const reqList = Array.isArray(requests) && requests.length
-      ? requests
-      : [{ model, messages: messages ?? [{ role: 'user', content: String(prompt ?? '') }], max_tokens: 256 }];
-
-    // 1. Fund gate — surface the human ask if short, do nothing on-chain.
-    const funding = await this.ensureFundedFor(budget);
-    if (!funding.ok) return { status: 'funding_required', funding };
-
-    // 2. Discover via the book (free read). Filter to open direct offers within maxPrice.
-    const book = await this._req('GET', `/book?model=${encodeURIComponent(model)}`);
-    let offers = (book.body?.offers || []).filter((o) =>
-      o.tier === 'direct' && o.status === 'open'
-      && (!sellerId || o.agentId === sellerId)
-      && (!(maxPrice > 0) || (Number(o.outputPricePerMTok) <= maxPrice && Number(o.inputPricePerMTok) <= maxPrice)));
-    offers.sort((a, b) => (Number(a.outputPricePerMTok) || 0) - (Number(b.outputPricePerMTok) || 0));
-    if (!offers.length) return { status: 'no_offers', model, maxPrice };
-
-    // 3. Try cheapest-first; a bad/disputed draw moves to the next route.
-    const tried = [];
-    for (const o of offers) {
-      const offer = { id: o.id, tier: 'direct', relayEndpoint: o.relayEndpoint, model, inputPricePerMTok: o.inputPricePerMTok, outputPricePerMTok: o.outputPricePerMTok, settlementPubkey: o.settlementPubkey, agentId: o.agentId };
-      const res = await this.drawFromSeller({ offer, totalNeedUsd: budget, sellerId: o.agentId, requests: reqList });
-      const draws = (res.chunks || []).filter((c) => c.kind === 'draw' && c.completion);
-      if (res.affirmed && !res.disputed && draws.length) {
-        const last = draws[draws.length - 1];
-        const funds = (res.chunks || []).filter((c) => c.kind === 'fund');
-        return {
-          status: 'ok', sellerId: o.agentId, offerId: o.id,
-          completions: draws.map((c) => c.completion),
-          fundedUsd: res.fundedUsd, spentUsd: res.drawnUsd, remainingUsd: last.remainingUsd,
-          txHashes: funds.flatMap((f) => [f.sellerTxHash, f.feeTxHash].filter(Boolean)),
-        };
-      }
-      tried.push({ sellerId: o.agentId, offerId: o.id, disputed: !!res.disputed });
-    }
-    return { status: 'all_disputed', model, tried };
-  }
+  async buy(opts = {}) { return buyClient(this, opts); }
 }
-
-// Metered USD of an OpenAI-shaped usage block at the offer's per-MTok prices.
-function meterUsd(usage, offer) {
-  const inTok = Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0;
-  const outTok = Number(usage?.completion_tokens ?? usage?.output_tokens ?? 0) || 0;
-  return (inTok * (Number(offer.inputPricePerMTok) || 0) + outTok * (Number(offer.outputPricePerMTok) || 0)) / 1e6;
-}
-const round6Usd = (n) => Math.round(n * 1e6) / 1e6;
 
 // Lowercase alias so the served sdk.mjs is importable as `mtok` (matching client.mjs's
 // `mtok` export and the house style), e.g. `const { mtok } = await import('.../sdk.mjs')`.

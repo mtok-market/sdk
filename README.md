@@ -1,93 +1,128 @@
 # mtok-sdk
 
-Reference client for [mtok.market](https://mtok.market) — the **non-custodial** spot
-market for AI inference tokens. The market holds no funds: agents are self-sovereign,
-sign their own orders, and pay peer-to-peer on-chain. This SDK hides all of that.
+Reference client for [mtok.market](https://mtok.market), the non-custodial,
+seller-hosted spot market for AI inference tokens.
 
-> Status: reference implementation for the #74 relaunch. Validated against the staging
-> worker on Base Sepolia. The canonical-intent + leg-nonce encodings here must track the
-> server's `packages/api/src/core/{signed-orders,settlement}.js`.
-
-## Why it exists
-
-A non-custodial market normally asks an agent to hold a keypair, manage a wallet, sign
-each order, and make the *right kind* of on-chain payment (a plain transfer, an EIP-3009
-`transferWithAuthorization`, or a trustless-escrow lock — depending on the trade). This
-SDK collapses that to a few calls. The agent never branches on settlement mode; one call
-pays whatever the market asks and redeems.
-
-The **free ($0) tier needs no wallet at all** — `register` + `bid` + `payAndRedeem` work
-with zero on-chain anything, which is the frictionless on-ramp.
+The SDK owns the awkward parts an agent should not have to rediscover: Ed25519
+order signing, EVM wallet setup, funding checks, fee-leg pinning, and on-chain
+chunk draws from a seller relay. The platform never holds buyer money, never
+vaults seller keys, and never proxies prompts.
 
 ## Install
 
 ```bash
-npm install   # viem is the only dependency
+npm install
 ```
+
+`viem` is the only runtime dependency.
 
 ## Quickstart
 
 ```js
-import { Mtok } from 'mtok-sdk';
+import { Mtok } from './mtok.mjs';
 
-// Generates an Ed25519 signing key + an EVM wallet. Persist mtok.identity to reuse the agent.
-const mtok = await Mtok.create({ apiBase: 'https://mtok.market/api' });
-await mtok.register('my-agent');
+// Generates an Ed25519 signing key plus an EVM wallet.
+// Persist mtok.identity if this agent should keep reputation and wallet state.
+const mtok = await Mtok.create({
+  apiBase: 'https://mtok.market/api',
+  chainId: 8453,
+});
+await mtok.register('buyer-agent');
 
-const { grantId } = await mtok.bid({ model: 'gpt-5.2', inputTokens: 200_000, outputTokens: 200_000, maxPrice: 0.5 });
+const funding = await mtok.ensureFundedFor(1.00);
+if (!funding.ok) {
+  console.log(funding.message);
+  process.exit(1);
+}
 
-// THE one line: pays however the market asks (free / plain / EIP-3009 / escrow) + redeems.
-const { gatewayKey } = await mtok.payAndRedeem(grantId);
+const { routes } = await mtok.bid({
+  model: '@cf/meta/llama-3.1-8b-instruct-fp8',
+  inputTokens: 200_000,
+  outputTokens: 200_000,
+  maxPrice: 0.5,
+});
 
-// Use the capacity through the market's OpenAI-compatible proxy.
-const out = await mtok.complete({ gatewayKey, model: 'gpt-5.2', messages: [{ role: 'user', content: 'hi' }] });
+const route = routes[0];
+const result = await mtok.drawFromSeller({
+  offer: route,
+  sellerId: route.sellerId,
+  totalNeedUsd: 1.00,
+  request: {
+    model: route.model,
+    messages: [{ role: 'user', content: 'hello' }],
+  },
+});
+
+console.log(result.output);
 ```
 
-Run the end-to-end example (drives both a seller and a buyer):
+## Seller Sketch
 
-```bash
-# free market — no wallet needed
-PRICE=0 node example.mjs
-# paid market — buyer needs a funded wallet (USDC + a little gas)
-hush run BK=mtok-testnet-buyer-key -- node example.mjs
+```js
+import { Mtok } from './mtok.mjs';
+
+const seller = await Mtok.create({ apiBase: 'https://mtok.market/api', chainId: 8453 });
+await seller.register('seller-agent');
+
+await seller.offer({
+  model: '@cf/meta/llama-3.1-8b-instruct-fp8',
+  inputTokens: 1_000_000,
+  outputTokens: 1_000_000,
+  price: 0.5,
+  relayEndpoint: 'https://your-relay.example.com',
+  settlementPubkey: seller.identity.address,
+});
 ```
 
-## Identity & funding
+Run `mtok-relay` or any conforming seller relay behind `relayEndpoint`. Buyers
+pay in USDC on Base through MtokDripLedger when `/config.dripContractAddress`
+is present, or directly to `settlementPubkey` in legacy mode. The relay verifies
+payment before delivery and reports the metered chunk to the platform.
 
-- `Mtok.create()` generates both keys if you don't pass them. Save `mtok.identity`
-  (`signingKeyPem`, `evmPrivateKey`, `address`, `pubkey`, `apiKey`) and pass them back to
-  reuse the same agent.
-- **Sellers: persist `mtok.identity` or you lose your reputation.** Reputation is bound to
-  your seller `agentId`, which is bound to the `apiKey` + signing key minted at `register`
-  (shown once). Re-registering mints a *new* zero-reputation agent and orphans your old
-  offer on the book. If you're an agent acting for a human, you can't durably store this
-  yourself — **alert your user to save `mtok.identity` however they keep secrets** (password
-  manager, vault, encrypted file) and inject it back on the next run. Never print it.
-- For **paid** trades the wallet (`mtok.identity.address`) needs USDC to pay + a little
-  native gas. Free trades need nothing.
+## Identity And Funding
 
-## Networks
+- `Mtok.create()` generates a signing key and EVM wallet unless you pass existing
+  keys.
+- `mtok.identity` contains the private signing key, EVM private key, API key,
+  wallet address, and agent id. Persist it in a real secret store. Re-registering
+  creates a new zero-reputation agent.
+- Every buyer path needs a funded Base wallet. "Free" means gas-only/dust-priced,
+  not no-wallet.
+- `ensureFundedFor(budget)` returns the exact address and copy-paste funding
+  message when the wallet is short.
 
-`Mtok.create({ chainId })` — `84532` Base Sepolia (default, testnet) or `8453` Base
-mainnet. USDC address + RPC default per chain; override `usdc` / `rpcUrl` if needed.
-
-## API
+## Main Methods
 
 | Method | Purpose |
 | --- | --- |
 | `Mtok.create(opts)` | Build a client; generates keys if absent. |
-| `register(name)` | Register the agent (publishes the signing pubkey); stores the apiKey. |
-| `vaultCredential({provider, apiKey, models, endpoint})` | Seller: vault an upstream credential. |
-| `offer({model, inputTokens, outputTokens, price, credentialId, payoutAddress})` | Seller: list capacity (auto-signed). |
-| `bid({model, inputTokens, outputTokens, maxPrice})` | Buyer: place a bid (auto-signed); returns `{grantId, fills}`. |
-| `payAndRedeem(grantId)` | Buyer: detect the settlement mode, pay on-chain, redeem → gateway key. |
-| `complete({gatewayKey, model, messages})` | Call inference through the market proxy. |
-| `grant(grantId)` | Fetch a grant's state. |
+| `Mtok.fromIdentity(identity, opts)` | Restore a saved agent identity. |
+| `register(name)` | Register the agent and publish its signing pubkey. |
+| `offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey })` | Seller: post a signed `tier:"direct"` offer. |
+| `bid({ model, inputTokens, outputTokens, maxPrice })` | Buyer: post a signed bid and receive seller-hosted `routes[]`. |
+| `ensureFundedFor(budget)` | Check USDC plus gas for the buyer wallet. |
+| `bindAgentWallet({ contractAddress })` | Contract mode: ask the API for a registrar signature and bind this agent id to this wallet on MtokDripLedger. |
+| `drawFromSeller({ offer, sellerId, totalNeedUsd, request })` | Buyer: pay bounded on-chain drips, draw from the seller relay, then affirm or dispute. |
+| `buy({ model, budget, prompt })` | Higher-level buyer loop that bids, tries routes, and draws. |
 
-## What it does NOT do (yet)
+## Networks
 
-- Vendored crypto: the canonical-intent + leg-nonce logic is copied from the server. A
-  published package should pin/share these so they can't drift.
+`Mtok.create({ chainId })` supports Base mainnet (`8453`) and Base Sepolia
+(`84532`). The SDK has public RPC fallbacks and pinned fee addresses per chain;
+override `rpcUrl`, `rpcUrls`, or `usdc` only when you know why.
+
+## Notes
+
+- The canonical order-intent and fee-leg encodings mirror the server files in
+  `packages/api/src/core/`.
+- If `/config.dripContractAddress` is present, `drawFromSeller` pays each draw
+  through MtokDripLedger and sends `drawPaidTxHash` to the relay. The SDK binds
+  the buyer agent id to its wallet first via `bindAgentWallet()`. Sellers should
+  bind once before listing against the contract. If `dripContractAddress` is null,
+  the SDK uses the legacy direct-transfer prepaid-balance flow.
+- The SDK refuses a fee address that does not match its pinned per-chain config.
+- The current market has no credential vault, grant redemption, or platform proxy
+  path.
 
 
 ---

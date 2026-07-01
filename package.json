@@ -9,6 +9,7 @@
   },
   "files": [
     "mtok.mjs",
+    "src",
     "README.md"
   ],
   "homepage": "https://mtok.market",
