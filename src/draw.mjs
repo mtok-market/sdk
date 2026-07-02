@@ -192,7 +192,10 @@ export async function drawFromSeller(client, {
           chunks.push({ kind: 'draw', n: drawN, drawId, replay: true, priorStatus, completion: null, usedUsd: 0, remainingUsd });
           return { output: outputParts.join(''), chunks, drawnUsd, fundedUsd, disputed: false, affirmed: false, replay: true };
         }
-        completion = await _relayFetch({ bookingId: activeBookingId, n: drawN, drawPaidTxHash, model: offer.model, buyerId: client.agentId, request: reqItem });
+        // requestHash rides along so the relay can verify the request against the
+        // DrawPaid event without recomputing trust itself (request_hash_required
+        // from the reference relay otherwise; found live seeding spot 2026-07-02).
+        completion = await _relayFetch({ bookingId: activeBookingId, n: drawN, drawPaidTxHash, requestHash: payment.requestHash, model: offer.model, buyerId: client.agentId, request: reqItem });
       } catch (e) {
         drawError = e;
       }
