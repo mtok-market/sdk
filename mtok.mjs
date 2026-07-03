@@ -185,9 +185,23 @@ export class Mtok {
   }
 
   async _payDraw(contractAddress, payment) {
-    const total = BigInt(payment.sellerUsdAtomic) + BigInt(payment.feeUsdAtomic || 0n);
-    await this._approveAndWait(contractAddress, total);
-    return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'payDraw', args: [payment] }));
+    // #451: USDC approve is an absolute SET, not an increment, and this
+    // approve-then-payDraw sequence has awaits between the legs. Two concurrent
+    // draws on ONE client (blessed: a watchAndFill payDraw while another watcher
+    // acts) would clobber each other's allowance -- B's approve lands between A's
+    // approve and A's payDraw, so A pulls against B's smaller allowance and
+    // reverts. The per-_write nonce chain (#419) only orders individual txs, not
+    // this logical PAIR. Serialize the whole approve+payDraw so concurrent callers
+    // queue and each draw's allowance is intact when its payDraw runs.
+    const run = (this._drawChain ?? Promise.resolve()).then(async () => {
+      const total = BigInt(payment.sellerUsdAtomic) + BigInt(payment.feeUsdAtomic || 0n);
+      await this._approveAndWait(contractAddress, total);
+      return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'payDraw', args: [payment] }));
+    });
+    // Keep the chain alive regardless of THIS draw's outcome so the next queued
+    // draw still runs (mirrors _write's tail-swallow).
+    this._drawChain = run.then(() => {}, () => {});
+    return run;
   }
   async bindAgentWallet({ contractAddress, deadline } = {}) {
     const target = contractAddress ?? (await this._req('GET', '/config', null, false)).body?.dripContractAddress;
