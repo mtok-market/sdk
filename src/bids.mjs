@@ -8,6 +8,7 @@
 // we know: bounded draws, ceiling-checked asks, and the honesty breadcrumb
 // (fillBid) that builds your wallet's public fill score.
 import { round6Usd } from './protocol.mjs';
+import { CHUNK_FLOOR } from './constants.mjs';
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -34,6 +35,21 @@ export async function watchAndFill(client, {
   const expiresAtMs = Number(bid.expiresAt) > 0 ? Number(bid.expiresAt) * 1000 : Infinity;
   const crosses = (inPrice, outPrice) =>
     (maxIn <= 0 || (Number(inPrice) || 0) <= maxIn) && (maxOut <= 0 || (Number(outPrice) || 0) <= maxOut);
+
+  // The market's real granularity is one chunk (CHUNK_FLOOR USD): a draw below
+  // it never funds, so a bid whose ENTIRE budget at its own ceilings cannot
+  // afford one chunk would make the default drawFn no-op forever. Fail loudly
+  // up front instead of silently watching a bid that can never fill. (An
+  // explicit drawFn override skips this: the caller owns their sizing.)
+  if (!drawFn) {
+    const fullBudgetUsd = (wantIn / 1e6) * maxIn + (wantOut / 1e6) * maxOut;
+    if (fullBudgetUsd < CHUNK_FLOOR) {
+      throw new Error(
+        `watchAndFill: the bid's full budget at its own ceilings (~$${round6Usd(fullBudgetUsd)}) is below the market's minimum draw ($${CHUNK_FLOOR}). ` +
+        'Size the bid to at least one chunk, or pass drawFn to own the sizing.',
+      );
+    }
+  }
 
   let gotIn = 0, gotOut = 0;
   const draws = [];
@@ -79,8 +95,12 @@ export async function watchAndFill(client, {
       (Math.max(0, wantIn - gotIn) / 1e6) * (Number(o.inputPricePerMTok) || 0)
       + (Math.max(0, wantOut - gotOut) / 1e6) * (Number(o.outputPricePerMTok) || 0),
     );
+    // Tail top-up: a nearly-satisfied bid can leave a remainder under the
+    // chunk floor, which would no-op. The default draw rounds the LAST slice
+    // up to one chunk (bounded over-buy, at most one chunk beyond the bid's
+    // budget, and only for bids that passed the up-front floor check).
     const _draw = drawFn ?? (async () => client.drawFromSeller({
-      offer, totalNeedUsd: budgetUsd, sellerId: offer.agentId,
+      offer, totalNeedUsd: Math.max(budgetUsd, CHUNK_FLOOR), sellerId: offer.agentId,
       ...(Array.isArray(requests) && requests.length ? { requests } : { request }),
     }));
 
