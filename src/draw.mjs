@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { configuredFeeUsd, DRAW_STATUS, meterUsd, PINNED_FEE_ADDRESSES, requiresFeeLeg, round6Usd, usdToAtomic } from './protocol.mjs';
+import { DRAW_STATUS, meterUsd, PINNED_FEE_ADDRESSES, requiresFeeLeg, round6Usd, usdToAtomic } from './protocol.mjs';
 import { CHUNK_FLOOR, DEFAULT_FEE_BPS } from './constants.mjs';
 
 const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
@@ -142,7 +142,18 @@ export async function drawFromSeller(client, {
       activeBookingId = activeBookingId ?? contractBookingId();
       const chunkUsd = Math.min(remainingBudget, Math.max(CHUNK_FLOOR, Math.min(est || CHUNK_FLOOR, recommendedMaxChunkUsd)));
       if (!(chunkUsd > 0.0001)) break;
-      const feeUsd = configuredFeeUsd({ amountUsd: chunkUsd, feeAddress: config.feeAddress, feeBps: feeRateBps });
+      const sellerUsdAtomic = usdToAtomic(chunkUsd);
+      // #9: the platform/relay floor rounds the fee UP -- ceil via the +5000
+      // (=10000/2) round-half-up on integer division, exactly
+      // packages/relay/lib.mjs configuredFeeAtomic. The old path computed
+      // configuredFeeUsd (round6Usd, then usdToAtomic) which TRUNCATED and, for
+      // ~13k sub-cent atomic amounts, paid exactly 1 atomic short => the relay
+      // rejected fee_amount_too_low AFTER we already paid on-chain. Compute the
+      // fee atomic with the SAME ceil expression so the SDK never under-pays the
+      // floor. (feeAddress unset / bps<=0 => no fee, matching configuredFeeUsd.)
+      const feeUsdAtomic = (config.feeAddress && feeRateBps > 0)
+        ? (sellerUsdAtomic * BigInt(Math.trunc(feeRateBps)) + 5000n) / 10000n
+        : 0n;
       const usagePrice = (v) => usdToAtomic(v ?? 0);
       const payment = {
         buyerAgentId: client.agentId,
@@ -151,8 +162,8 @@ export async function drawFromSeller(client, {
         offerId: offer.id,
         model: offer.model,
         n: drawN,
-        sellerUsdAtomic: usdToAtomic(chunkUsd),
-        feeUsdAtomic: usdToAtomic(feeUsd),
+        sellerUsdAtomic,
+        feeUsdAtomic,
         inputPricePerMTokAtomic: usagePrice(offer.inputPricePerMTok),
         outputPricePerMTokAtomic: usagePrice(offer.outputPricePerMTok),
         requestHash: hash32(reqItem),
