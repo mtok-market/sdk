@@ -223,11 +223,42 @@ export class Mtok {
   async _drawIdFor(contractAddress, payment) {
     return this.pub.readContract({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'drawIdFor', args: [payment] });
   }
+  // Read-your-write guard for the affirm/dispute-after-pay race (mtok-market#419). We just
+  // confirmed payDraw, but viem's fallback transport can route the very next call to a Base
+  // node that has not yet indexed that block, so affirmDraw/disputeDraw revert DrawNotPaid
+  // against a lagging node and strand a paid draw. Two lines of defense: (1) poll the draw
+  // status until at least one node reports it past None (the pay is propagating), then (2)
+  // retry the WRITE itself on a DrawNotPaid revert with backoff, since the write can still land
+  // on a node behind the one we polled. A draw already Affirmed/Disputed short-circuits to done.
+  async _submitTerminalDraw(fnName, contractAddress, drawId, args, terminalStatus) {
+    for (let i = 0; i < 8; i++) {
+      const status = await this._drawStatus(contractAddress, drawId);
+      if (status === terminalStatus) return null; // already in the target terminal state (a prior attempt landed)
+      if (status !== DRAW_STATUS.None) break; // Paid and visible on at least one node: safe to submit
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    let lastErr;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        return await this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: fnName, args }));
+      } catch (e) {
+        lastErr = e;
+        // Only the read-your-write races are retryable: a node behind on the payDraw
+        // (DrawNotPaid), or a submit that raced a still-mining pay. A real revert (over-affirm,
+        // wrong caller, already terminal) is not, so rethrow anything else immediately.
+        const msg = String(e?.message ?? e);
+        if (!/DrawNotPaid|nonce|replacement|already known/i.test(msg)) throw e;
+        this._nonce = null; // resync the local nonce before the retry
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  }
   async _affirmDraw(contractAddress, drawId, { inputTokens, outputTokens, deliveredUsdAtomic, responseHash }) {
-    return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'affirmDraw', args: [drawId, BigInt(inputTokens), BigInt(outputTokens), BigInt(deliveredUsdAtomic), responseHash] }));
+    return this._submitTerminalDraw('affirmDraw', contractAddress, drawId, [drawId, BigInt(inputTokens), BigInt(outputTokens), BigInt(deliveredUsdAtomic), responseHash], DRAW_STATUS.Affirmed);
   }
   async _disputeDraw(contractAddress, drawId, reasonHash) {
-    return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'disputeDraw', args: [drawId, reasonHash] }));
+    return this._submitTerminalDraw('disputeDraw', contractAddress, drawId, [drawId, reasonHash], DRAW_STATUS.Disputed);
   }
 
   // ---- on-chain buy-side bids (MtokBidBoard, #419) ----
