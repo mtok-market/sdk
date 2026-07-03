@@ -12,6 +12,11 @@ import { CHUNK_FLOOR } from './constants.mjs';
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Floor for the poll interval. pollMs:0 (with the default maxPolls:Infinity) would be
+// a hot loop hammering /spot + /book with no backoff; clamp to a sane minimum. A caller
+// that genuinely wants faster polling can still raise it, just not below this.
+const MIN_POLL_MS = 1000;
+
 export async function watchAndFill(client, {
   bid,                    // the object postBid returned (bidId, model, ceilings, sizes, expiresAt)
   pollMs = 15_000,
@@ -25,6 +30,8 @@ export async function watchAndFill(client, {
   if (!drawFn && !request && !(Array.isArray(requests) && requests.length)) {
     throw new Error('watchAndFill: pass drawFn or request/requests so a crossing ask can actually be drawn');
   }
+  // Floor the poll interval so a 0 (or negative / NaN) can't spin a hot loop.
+  pollMs = Math.max(MIN_POLL_MS, Number(pollMs) || 0);
 
   // Ceilings in USD/MTok. A missing/zero ceiling means that dimension is
   // unconstrained (the contract requires at least one to be set).
@@ -120,7 +127,14 @@ export async function watchAndFill(client, {
     // cancel is needed. Calling it is optional protocol-wise, but it is the
     // breadcrumb that builds this wallet's public fill score.
     if (gotIn >= wantIn && gotOut >= wantOut && lastDrawId) {
-      const fillTxHash = await client.fillBid(bid.bidId, lastDrawId);
+      // BEST-EFFORT fillBid (#419): the draws are already paid for and delivered. A long
+      // draw can expire the bid mid-flight, so the on-chain fillBid reverts -- but that must
+      // NOT reject watchAndFill and throw away the delivery the caller already paid for and
+      // received. fillBid is only the honesty breadcrumb (the public fill score); the draws
+      // stand without it. Mirror cancelBid's best-effort try/catch: return the filled result
+      // with fillTxHash null so the caller keeps the full delivery record.
+      let fillTxHash = null;
+      try { fillTxHash = await client.fillBid(bid.bidId, lastDrawId); } catch { /* best-effort; the paid draws stand */ }
       return result('filled', { drawId: lastDrawId, fillTxHash });
     }
     // Partial (or disputed) draw: keep watching; the next crossing ask covers

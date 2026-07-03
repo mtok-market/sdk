@@ -125,7 +125,23 @@ export class Mtok {
   // (mtok-market#128). We read the pending nonce once and increment locally; a failed
   // SUBMISSION resets it so the next write re-syncs from chain (a mined-but-reverted tx
   // still consumed its nonce, so we reset ONLY when writeContract itself throws).
+  //
+  // SERIALIZED (mtok-market#419): the read-submit-increment was a check-then-act race on
+  // ONE client. Two concurrent _writes (e.g. a watchAndFill payDraw in flight while another
+  // watcher cancelBids) both read this._nonce = N, both submit N, and the loser's catch set
+  // this._nonce = null, clobbering the winner's N+1. We chain every _write onto a single
+  // in-process promise so the whole read + submit + increment runs atomically per write, one
+  // at a time. Concurrent callers queue instead of colliding: each gets a distinct nonce, and
+  // a failed write's reset can no longer stomp a concurrent winner (there is never a
+  // concurrent winner mid-flight). The chain never rejects (we swallow the tail so one
+  // failed write does not poison the queue); the real error still propagates to its caller.
   async _write(opts) {
+    const run = (this._writeChain ?? Promise.resolve()).then(() => this.#writeNow(opts));
+    // Keep the chain alive regardless of THIS write's outcome so the next queued write runs.
+    this._writeChain = run.then(() => {}, () => {});
+    return run;
+  }
+  async #writeNow(opts) {
     if (this._nonce == null) this._nonce = await this.pub.getTransactionCount({ address: this.account.address, blockTag: 'pending' });
     const nonce = this._nonce;
     try { const hash = await this.wallet.writeContract({ ...opts, nonce }); this._nonce = nonce + 1; return hash; }
