@@ -17,10 +17,11 @@ import crypto from 'node:crypto';
 import { createWalletClient, createPublicClient, http, fallback } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { baseSepolia, base } from 'viem/chains';
-import { DRIP_LEDGER, DRAW_STATUS, ERC20, signIntent, TWA } from './src/protocol.mjs';
-export { PINNED_FEE_ADDRESSES } from './src/protocol.mjs';
+import { BID_BOARD, BID_MAX_TTL_SECONDS, BID_POSTED_TOPIC, DRIP_LEDGER, DRAW_STATUS, ERC20, PINNED_BID_BOARD_ADDRESSES, signIntent, TWA, usdToAtomic } from './src/protocol.mjs';
+export { PINNED_FEE_ADDRESSES, PINNED_BID_BOARD_ADDRESSES } from './src/protocol.mjs';
 import { ensureFundedFor as ensureFundedForClient, walletBalances } from './src/funding.mjs';
 import { buy as buyClient, drawFromSeller as drawFromSellerClient } from './src/draw.mjs';
+import { watchAndFill as watchAndFillClient } from './src/bids.mjs';
 
 export class Mtok {
   constructor(cfg) { Object.assign(this, cfg); }
@@ -212,6 +213,51 @@ export class Mtok {
   async _disputeDraw(contractAddress, drawId, reasonHash) {
     return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'disputeDraw', args: [drawId, reasonHash] }));
   }
+
+  // ---- on-chain buy-side bids (MtokBidBoard, #419) ----
+  // Bidding is wallet-keyed: no platform registration, no API key. You pay gas
+  // to advertise a commitment on the public board; that gas IS the spam filter.
+  _bidBoardAddress(contractAddress, fn) {
+    const target = contractAddress ?? PINNED_BID_BOARD_ADDRESSES[this.chainId];
+    if (!target) throw new Error(`${fn}: no bid board pinned for chain ${this.chainId}; pass contractAddress`);
+    return target;
+  }
+  // Post a bid: "I will buy <tokens> of <model> at or under these USD/MTok
+  // ceilings, until expiresAt". Prices are plain USD/MTok (converted to the
+  // contract's atomic 1e6 units here). TTL is capped at 24h ON CHAIN
+  // (ExpiryTooFar); the clamp below just saves you the reverted gas.
+  async postBid({ model, maxInputPricePerMTok = 0, maxOutputPricePerMTok = 0, inputTokens = 0, outputTokens = 0, ttlSeconds = 3600, contractAddress } = {}) {
+    if (!model) throw new Error('postBid: model is required');
+    const target = this._bidBoardAddress(contractAddress, 'postBid');
+    const expiresAt = BigInt(Math.floor(Date.now() / 1000) + Math.min(Math.max(1, Math.trunc(Number(ttlSeconds) || 0)), BID_MAX_TTL_SECONDS));
+    const txHash = await this._confirm(await this._write({
+      address: target, abi: BID_BOARD, functionName: 'postBid',
+      args: [model, usdToAtomic(maxInputPricePerMTok), usdToAtomic(maxOutputPricePerMTok), BigInt(inputTokens), BigInt(outputTokens), expiresAt],
+    }));
+    // The bidId rides in the receipt as BidPosted's first indexed topic.
+    const receipt = await this.pub.getTransactionReceipt({ hash: txHash });
+    const posted = (receipt?.logs ?? []).find((l) => String(l.address).toLowerCase() === target.toLowerCase() && l.topics?.[0] === BID_POSTED_TOPIC);
+    return {
+      txHash, bidId: posted?.topics?.[1] ?? null,
+      model, maxInputPricePerMTok, maxOutputPricePerMTok, inputTokens, outputTokens,
+      expiresAt: Number(expiresAt),
+    };
+  }
+  // Cancel a live bid (poster only). Cancelling when you stop watching keeps
+  // the public board honest and protects your wallet's bid reputation.
+  async cancelBid(bidId, { contractAddress } = {}) {
+    return this._confirm(await this._write({ address: this._bidBoardAddress(contractAddress, 'cancelBid'), abi: BID_BOARD, functionName: 'cancelBid', args: [bidId] }));
+  }
+  // The honesty breadcrumb: link a bid to the MtokDripLedger draw that
+  // satisfied it. Optional to call, but calling it is what builds your
+  // wallet's public fill score (posted vs filled vs walked-away, all
+  // chain-derived, recomputable by anyone).
+  async fillBid(bidId, drawId, { contractAddress } = {}) {
+    return this._confirm(await this._write({ address: this._bidBoardAddress(contractAddress, 'fillBid'), abi: BID_BOARD, functionName: 'fillBid', args: [bidId, drawId] }));
+  }
+  // Watch the market for an ask that crosses the bid's ceilings, draw through
+  // the existing spot flow, fillBid the satisfying draw. See src/bids.mjs.
+  async watchAndFill(opts = {}) { return watchAndFillClient(this, opts); }
 
   async _walletBalances() { return walletBalances(this); }
 

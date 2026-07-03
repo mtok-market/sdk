@@ -55,10 +55,42 @@ export const DRIP_LEDGER = parseAbi([
 // DrawStatus enum in MtokDripLedger.sol (order is load-bearing — matches the on-chain enum).
 export const DRAW_STATUS = { None: 0, Paid: 1, Affirmed: 2, Disputed: 3 };
 
+// MtokBidBoard (buy-side bids, #419): a permissionless stage-A event registry.
+// It holds no money and settles nothing; posting is wallet-keyed (no platform
+// registration) and the sub-cent gas cost is the spam filter.
+export const BID_BOARD = parseAbi([
+  'function postBid(string model,uint256 maxInputPricePerMTokAtomic,uint256 maxOutputPricePerMTokAtomic,uint256 inputTokens,uint256 outputTokens,uint64 expiresAt) returns (bytes32)',
+  'function cancelBid(bytes32 bidId)',
+  'function fillBid(bytes32 bidId,bytes32 drawId)',
+  'function MAX_TTL() view returns (uint64)',
+  // public `bids` mapping auto-getter: BidStatus is None=0, Live=1, Cancelled=2, Filled=3.
+  'function bids(bytes32 bidId) view returns (address poster,uint64 expiresAt,uint8 status)',
+]);
+
+// BidPosted(bytes32 indexed bidId, address indexed poster, string model, ...):
+// topic0 pin matching packages/api/src/core/chain-events.js, used to pull the
+// bidId (topic1) back out of the postBid receipt.
+export const BID_POSTED_TOPIC = '0x547403381358595d936cf3da4b6cd0fc83df74042c6ac2c9b13ade4a89d67e88';
+
+// BidStatus enum in MtokBidBoard.sol (order matches the on-chain enum).
+export const BID_STATUS = { None: 0, Live: 1, Cancelled: 2, Filled: 3 };
+
 export const PINNED_FEE_ADDRESSES = {
   8453: '0x6B5FED4aca54Ca89d95b822fD64c8545D34B673b',
   84532: '0x25EFcbfD32C3f769690aA1181d48565f69c855E1',
 };
+
+// The deployed MtokBidBoard per chain, pinned client-side like the fee
+// addresses above: a fixed per-chain constant, so a tampered /api response can
+// never redirect your bid transactions to a different contract.
+export const PINNED_BID_BOARD_ADDRESSES = {
+  8453: '0x49679B9b9c56DeD21F36381dF7398D81fb6682c8',
+  84532: '0x7652a2738A1Ba8F821F6A502CF05b55D652ec116',
+};
+
+// The contract enforces this on chain (postBid reverts ExpiryTooFar); the
+// constant is here so a client can size its TTL without an RPC round-trip.
+export const BID_MAX_TTL_SECONDS = 86400;
 
 export function meterUsd(usage, offer) {
   const inTok = Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0;
