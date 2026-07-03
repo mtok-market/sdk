@@ -239,15 +239,23 @@ export class Mtok {
     }
     let lastErr;
     for (let attempt = 0; attempt < 5; attempt++) {
+      // Re-check status before EVERY attempt, not just the first. A prior attempt's write can
+      // land on-chain and then have its RESPONSE lost (a fallback-node blip makes writeContract
+      // throw after the tx was already mined). Without this, the retry fires a second terminal
+      // call that reverts "already terminal" with a non-retryable error and strands the draw.
+      if (attempt > 0 && (await this._drawStatus(contractAddress, drawId)) === terminalStatus) return null;
       try {
         return await this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: fnName, args }));
       } catch (e) {
         lastErr = e;
         // Only the read-your-write races are retryable: a node behind on the payDraw
         // (DrawNotPaid), or a submit that raced a still-mining pay. A real revert (over-affirm,
-        // wrong caller, already terminal) is not, so rethrow anything else immediately.
+        // wrong caller, already terminal) is not, so rethrow anything else immediately. Match
+        // BOTH the decoded custom-error name AND its raw 4-byte selector 0x53ebc06d: viem
+        // usually decodes DrawNotPaid from the ABI, but some fallback-transport error paths
+        // surface only the undecoded revert data, and missing that would strand the draw.
         const msg = String(e?.message ?? e);
-        if (!/DrawNotPaid|nonce|replacement|already known/i.test(msg)) throw e;
+        if (!/DrawNotPaid|0x53ebc06d|nonce|replacement|already known/i.test(msg)) throw e;
         this._nonce = null; // resync the local nonce before the retry
         await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
       }
