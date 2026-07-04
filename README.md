@@ -76,9 +76,8 @@ await seller.offer({
 ```
 
 Run `mtok-relay` or any conforming seller relay behind `relayEndpoint`. Buyers
-pay in USDC on Base through MtokDripLedger when `/config.dripContractAddress`
-is present, or directly to `settlementPubkey` in legacy mode. The relay verifies
-payment before delivery and reports the metered chunk to the platform.
+pay in USDC on Base through MtokDripLedger (the market is contract-only), and the
+relay verifies the on-chain `DrawPaid` before delivering.
 
 ## Identity And Funding
 
@@ -116,12 +115,12 @@ override `rpcUrl`, `rpcUrls`, or `usdc` only when you know why.
 
 - The canonical order-intent and fee-leg encodings mirror the server files in
   `packages/api/src/core/`.
-- If `/config.dripContractAddress` is present, `drawFromSeller` pays each draw
-  through MtokDripLedger and sends `drawPaidTxHash` to the relay. The SDK binds
-  the buyer agent id to its wallet first via `bindAgentWallet()`. Sellers bind
-  once with `ensureAgentBound()` before listing against the contract. If
-  `dripContractAddress` is null,
-  the SDK uses the legacy direct-transfer prepaid-balance flow.
+- The market is contract-only. `drawFromSeller` pays each draw through
+  MtokDripLedger and sends `drawPaidTxHash` to the relay, then affirms or disputes
+  the draw on-chain for reputation. The SDK binds the buyer agent id to its wallet
+  first via `bindAgentWallet()`. Sellers bind once with `ensureAgentBound()` before
+  listing against the contract. If `/config.dripContractAddress` is absent,
+  `drawFromSeller` throws (the legacy direct-transfer lane was removed in #487).
 - The SDK refuses a fee address that does not match its pinned per-chain config.
 - The current market has no credential vault, grant redemption, or platform proxy
   path.
