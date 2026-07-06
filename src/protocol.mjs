@@ -49,7 +49,7 @@ export const DRIP_LEDGER = parseAbi([
   'function disputeDraw(bytes32 drawId,bytes32 reasonHash)',
   // public `draws` mapping auto-getter: returns the DrawRecord tuple. `status` is the
   // idempotency signal for the contract-mode replay guard (mtok-market#128).
-  'function draws(bytes32 drawId) view returns (bytes32 buyerAgentKey,bytes32 sellerAgentKey,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint64 paidAt,uint8 status)',
+  'function draws(bytes32 drawId) view returns (bytes32 buyerAgentKey,bytes32 sellerAgentKey,address buyer,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint64 paidAt,uint8 status)',
 ]);
 
 // DrawStatus enum in MtokDripLedger.sol (order is load-bearing — matches the on-chain enum).

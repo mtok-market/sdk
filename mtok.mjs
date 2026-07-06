@@ -180,7 +180,10 @@ export class Mtok {
   async _drawStatus(contractAddress, drawId) {
     try {
       const rec = await this.pub.readContract({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'draws', args: [drawId] });
-      return Number(rec?.[5] ?? DRAW_STATUS.None);
+      // DrawRecord is (buyerAgentKey, sellerAgentKey, buyer, sellerUsdAtomic, feeUsdAtomic,
+      // paidAt, status): status is index 6. #543 added `address buyer` at index 2; the ABI +
+      // this index MUST track it or the replay/terminal-idempotency guard reads paidAt as status.
+      return Number(rec?.[6] ?? DRAW_STATUS.None);
     } catch { return DRAW_STATUS.None; }
   }
 

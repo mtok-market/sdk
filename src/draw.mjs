@@ -96,6 +96,17 @@ export async function drawFromSeller(client, {
       ? (sellerUsdAtomic * BigInt(Math.trunc(feeRateBps)) + 5000n) / 10000n
       : 0n;
     const usagePrice = (v) => usdToAtomic(v ?? 0);
+    // #545 + #(codex review): pin the seller wallet we intend to pay (the offer's advertised
+    // settlement wallet), so payDraw reverts SellerMismatch if a registrar rebound the seller's
+    // agent-id to a different wallet between this offer and our pay. THROW on a present-but-
+    // malformed settlementPubkey rather than silently zero-pinning (which would drop the
+    // redirect protection without any signal). An absent wallet zero-skips explicitly.
+    const isEvmAddr = (a) => /^0x[0-9a-fA-F]{40}$/.test(a ?? '');
+    const settle = offer.settlementPubkey;
+    if (settle != null && settle !== '' && !isEvmAddr(settle)) {
+      throw new Error(`drawFromSeller: offer ${offer.id} has a malformed settlementPubkey (${JSON.stringify(settle)}); refusing to pay because the seller wallet cannot be pinned`);
+    }
+    const expectedSeller = isEvmAddr(settle) ? settle : '0x0000000000000000000000000000000000000000';
     const payment = {
       buyerAgentId: client.agentId,
       sellerAgentId: sellerId,
@@ -109,13 +120,7 @@ export async function drawFromSeller(client, {
       outputPricePerMTokAtomic: usagePrice(offer.outputPricePerMTok),
       requestHash: hash32(reqItem),
       deadline: BigInt(Math.floor(Date.now() / 1000) + 3600),
-      // #545: pin the seller wallet we intend to pay (the offer's advertised settlement
-      // wallet). payDraw reverts SellerMismatch if a registrar rebound the seller's agent-id
-      // to a different wallet between this offer and our pay, so a hijacked binding cannot
-      // redirect our USDC. Skips (zero) when the offer carries no valid EVM wallet.
-      expectedSeller: /^0x[0-9a-fA-F]{40}$/.test(offer.settlementPubkey ?? '')
-        ? offer.settlementPubkey
-        : '0x0000000000000000000000000000000000000000',
+      expectedSeller,
     };
 
     let drawPaidTxHash, drawId, completion, drawError, replayed = false, priorStatus;
