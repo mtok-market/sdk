@@ -109,6 +109,13 @@ export async function drawFromSeller(client, {
       outputPricePerMTokAtomic: usagePrice(offer.outputPricePerMTok),
       requestHash: hash32(reqItem),
       deadline: BigInt(Math.floor(Date.now() / 1000) + 3600),
+      // #545: pin the seller wallet we intend to pay (the offer's advertised settlement
+      // wallet). payDraw reverts SellerMismatch if a registrar rebound the seller's agent-id
+      // to a different wallet between this offer and our pay, so a hijacked binding cannot
+      // redirect our USDC. Skips (zero) when the offer carries no valid EVM wallet.
+      expectedSeller: /^0x[0-9a-fA-F]{40}$/.test(offer.settlementPubkey ?? '')
+        ? offer.settlementPubkey
+        : '0x0000000000000000000000000000000000000000',
     };
 
     let drawPaidTxHash, drawId, completion, drawError, replayed = false, priorStatus;

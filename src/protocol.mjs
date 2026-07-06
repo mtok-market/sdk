@@ -43,8 +43,8 @@ export const DRIP_LEDGER = parseAbi([
   'function agentWallet(bytes32 agentKey) view returns (address)',
   'function bindNonces(bytes32 agentKey) view returns (uint256)',
   'function bindAgent(string agentId,address wallet,uint256 deadline,bytes signature)',
-  'function payDraw((string buyerAgentId,string sellerAgentId,string bookingId,string offerId,string model,uint32 n,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint256 inputPricePerMTokAtomic,uint256 outputPricePerMTokAtomic,bytes32 requestHash,uint256 deadline)) returns (bytes32)',
-  'function drawIdFor((string buyerAgentId,string sellerAgentId,string bookingId,string offerId,string model,uint32 n,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint256 inputPricePerMTokAtomic,uint256 outputPricePerMTokAtomic,bytes32 requestHash,uint256 deadline)) view returns (bytes32)',
+  'function payDraw((string buyerAgentId,string sellerAgentId,string bookingId,string offerId,string model,uint32 n,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint256 inputPricePerMTokAtomic,uint256 outputPricePerMTokAtomic,bytes32 requestHash,uint256 deadline,address expectedSeller)) returns (bytes32)',
+  'function drawIdFor((string buyerAgentId,string sellerAgentId,string bookingId,string offerId,string model,uint32 n,uint256 sellerUsdAtomic,uint256 feeUsdAtomic,uint256 inputPricePerMTokAtomic,uint256 outputPricePerMTokAtomic,bytes32 requestHash,uint256 deadline,address expectedSeller)) view returns (bytes32)',
   'function affirmDraw(bytes32 drawId,uint256 inputTokens,uint256 outputTokens,uint256 deliveredUsdAtomic,bytes32 responseHash)',
   'function disputeDraw(bytes32 drawId,bytes32 reasonHash)',
   // public `draws` mapping auto-getter: returns the DrawRecord tuple. `status` is the
