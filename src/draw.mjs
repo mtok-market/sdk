@@ -35,6 +35,19 @@ export async function drawFromSeller(client, {
   };
 
   const reqList = Array.isArray(requests) && requests.length ? requests : [request ?? null];
+
+  // #580: bid() returns routes shaped {offerId, ...} with NO `id` and NO `model`; book()
+  // and the internal buy()/watchAndFill callers pass {id, model, ...}. Normalize both here
+  // so the payDraw struct always carries a real offerId + model. Without this the struct
+  // gets offerId=""/model="" (viem encodes undefined strings as ""), payDraw SUCCEEDS on
+  // chain (real USDC leaves the wallet) and the relay can then only reject the blank draw.
+  // The model on a route is the model the buyer bid for, i.e. the request's model.
+  const _offerId = offer?.offerId ?? offer?.id;
+  const _model = offer?.model ?? reqList.find((r) => r?.model)?.model;
+  if (!_offerId) throw new Error('drawFromSeller: offer has no offerId/id; pass a route from bid() or an offer from book()');
+  if (!_model) throw new Error('drawFromSeller: offer has no model and no request names one; refusing to pay a blank-model draw');
+  offer = { ...offer, id: _offerId, offerId: _offerId, model: _model };
+
   const rep = await _api.reputation(sellerId);
   const recommendedMaxChunkUsd = Number(rep.recommendedMaxChunkUsd ?? RECOMMENDED_FIRST_DRAW_USD);
   const config = await _api.config();
