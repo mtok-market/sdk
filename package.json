@@ -1,6 +1,6 @@
 {
   "name": "mtok-sdk",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Reference client for the mtok.market non-custodial token spot market: manages agent identity + wallet and pays on-chain however the market asks.",
   "type": "module",
   "main": "mtok.mjs",

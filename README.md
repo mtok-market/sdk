@@ -56,6 +56,49 @@ const result = await mtok.drawFromSeller({
 console.log(result.output);
 ```
 
+## Batch Jobs
+
+For list classification, extraction, tagging, or summarization, split the work
+into model-safe chunks and ask for JSON indexes instead of copied labels.
+
+```js
+import { Mtok, buildIndexedJsonBatch, parseIndexedJsonList } from 'mtok-sdk';
+
+const model = '@cf/mistralai/mistral-small-3.1-24b-instruct';
+const labels = ['Boom Boom', 'Grandma', 'the weather'];
+
+const { chunks, requests } = buildIndexedJsonBatch(labels, {
+  model,
+  chunkSize: 60,
+  makePrompt: (items) => `Return JSON only: {"matches":[0,3]}.
+Each number must be an index from this list:
+${items.map((label, i) => `${i}. ${label}`).join('\n')}`,
+});
+
+const result = await mtok.buy({
+  model,
+  sellerId: 'agt_4kq6eypt',
+  maxPrice: 2.5,
+  budget: requests.length * 0.006,
+  requests,
+});
+
+const matches = new Set();
+for (const [i, completion] of result.completions.entries()) {
+  const text = completion.choices?.[0]?.message?.content ?? '';
+  for (const label of parseIndexedJsonList(text, chunks[i], { key: 'matches' })) {
+    matches.add(label);
+  }
+}
+```
+
+Start with 40 to 60 items per request, parse only indexes that point to supplied
+items, and run a small eval with known positives before unattended writes. The
+full recipe is at `https://mtok.market/batch-jobs.md`. These helpers are advice,
+not a gate: tune prompts, chunk sizes, parsers, retries, and model choice for the
+job. Paid market delivery still goes through MtokDripLedger and on-chain
+affirm/dispute.
+
 ## Seller Sketch
 
 ```js
@@ -104,6 +147,8 @@ relay verifies the on-chain `DrawPaid` before delivering.
 | `bindAgentWallet({ contractAddress })` | Contract mode: ask the API for a registrar signature and bind this agent id to this wallet on MtokDripLedger. |
 | `drawFromSeller({ offer, sellerId, totalNeedUsd, request })` | Buyer: pay bounded on-chain drips, draw from the seller relay, then affirm or dispute. |
 | `buy({ model, budget, prompt })` | Higher-level buyer loop that bids, tries routes, and draws. |
+| `buildIndexedJsonBatch(items, opts)` | Build chunked OpenAI-style requests for list jobs that should return JSON indexes. |
+| `parseIndexedJsonList(text, labels, opts)` | Parse JSON index lists defensively, ignoring invented labels and out-of-range indexes. |
 
 ## Networks
 

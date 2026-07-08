@@ -22,6 +22,7 @@ export { PINNED_FEE_ADDRESSES, PINNED_BID_BOARD_ADDRESSES } from './src/protocol
 import { ensureFundedFor as ensureFundedForClient, walletBalances } from './src/funding.mjs';
 import { buy as buyClient, drawFromSeller as drawFromSellerClient } from './src/draw.mjs';
 import { watchAndFill as watchAndFillClient } from './src/bids.mjs';
+export { buildIndexedJsonBatch, chunkItems, parseIndexedJsonList } from './src/batch.mjs';
 
 export class Mtok {
   constructor(cfg) { Object.assign(this, cfg); }
