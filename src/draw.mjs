@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { DRAW_STATUS, meterUsd, PINNED_FEE_ADDRESSES, round6Usd, usdToAtomic } from './protocol.mjs';
-import { CHUNK_FLOOR, DEFAULT_FEE_BPS } from './constants.mjs';
+import { DEFAULT_FEE_BPS, MIN_DRAW_USD, RECOMMENDED_FIRST_DRAW_USD } from './constants.mjs';
 
 const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
 const contractBookingId = () => 'bkgc_' + crypto.randomBytes(12).toString('base64url').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -36,7 +36,7 @@ export async function drawFromSeller(client, {
 
   const reqList = Array.isArray(requests) && requests.length ? requests : [request ?? null];
   const rep = await _api.reputation(sellerId);
-  const recommendedMaxChunkUsd = rep.recommendedMaxChunkUsd ?? CHUNK_FLOOR;
+  const recommendedMaxChunkUsd = Number(rep.recommendedMaxChunkUsd ?? RECOMMENDED_FIRST_DRAW_USD);
   const config = await _api.config();
 
   const pinnedFee = PINNED_FEE_ADDRESSES[client.chainId];
@@ -59,7 +59,7 @@ export async function drawFromSeller(client, {
   const estimateCost = (r) => {
     const maxOut = Number(r?.max_tokens) || 0;
     if (outPrice > 0 && maxOut > 0) return (maxOut / 1e6) * outPrice;
-    return CHUNK_FLOOR;
+    return 0;
   };
 
   let remainingBudget = totalNeedUsd;
@@ -81,8 +81,16 @@ export async function drawFromSeller(client, {
       checkedContractBinding = true;
     }
     activeBookingId = activeBookingId ?? contractBookingId();
-    const chunkUsd = Math.min(remainingBudget, Math.max(CHUNK_FLOOR, Math.min(est || CHUNK_FLOOR, recommendedMaxChunkUsd)));
-    if (!(chunkUsd > 0.0001)) break;
+    const recommendedCapUsd = Number.isFinite(recommendedMaxChunkUsd) && recommendedMaxChunkUsd > 0
+      ? recommendedMaxChunkUsd
+      : RECOMMENDED_FIRST_DRAW_USD;
+    const drawCapUsd = Math.min(Number(remainingBudget) || 0, recommendedCapUsd);
+    if (drawCapUsd < MIN_DRAW_USD) break;
+    const defaultProbeUsd = Math.min(RECOMMENDED_FIRST_DRAW_USD, drawCapUsd);
+    const estimatedUsd = est > 0 ? Math.min(est, drawCapUsd) : 0;
+    const targetUsd = Math.max(MIN_DRAW_USD, defaultProbeUsd, estimatedUsd);
+    const chunkUsd = round6Usd(Math.min(drawCapUsd, targetUsd));
+    if (chunkUsd < MIN_DRAW_USD) break;
     const sellerUsdAtomic = usdToAtomic(chunkUsd);
     // #9: the platform/relay floor rounds the fee UP -- ceil via the +5000
     // (=10000/2) round-half-up on integer division, exactly
@@ -234,12 +242,14 @@ export async function buy(client, { model, budget, prompt, messages, requests, m
     const draws = (res.chunks || []).filter((c) => c.kind === 'draw' && c.completion);
     if (res.affirmed && !res.disputed && draws.length) {
       const last = draws[draws.length - 1];
-      const funds = (res.chunks || []).filter((c) => c.kind === 'fund');
+      const txHashes = (res.chunks || []).flatMap((c) => c.kind === 'draw'
+        ? [c.drawPaidTxHash, c.affirmTxHash].filter(Boolean)
+        : [c.sellerTxHash, c.feeTxHash].filter(Boolean));
       return {
         status: 'ok', sellerId: o.agentId, offerId: o.id,
         completions: draws.map((c) => c.completion),
         fundedUsd: res.fundedUsd, spentUsd: res.drawnUsd, remainingUsd: last.remainingUsd,
-        txHashes: funds.flatMap((f) => [f.sellerTxHash, f.feeTxHash].filter(Boolean)),
+        txHashes,
       };
     }
     tried.push({ sellerId: o.agentId, offerId: o.id, disputed: !!res.disputed });

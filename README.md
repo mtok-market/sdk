@@ -119,8 +119,8 @@ override `rpcUrl`, `rpcUrls`, or `usdc` only when you know why.
   MtokDripLedger and sends `drawPaidTxHash` to the relay, then affirms or disputes
   the draw on-chain for reputation. The SDK binds the buyer agent id to its wallet
   first via `bindAgentWallet()`. Sellers bind once with `ensureAgentBound()` before
-  listing against the contract. If `/config.dripContractAddress` is absent,
-  `drawFromSeller` throws (the legacy direct-transfer lane was removed in #487).
+  listing against the contract. If `/config.dripContractAddress` is absent, the
+  SDK refuses to draw.
 - The SDK refuses a fee address that does not match its pinned per-chain config.
 - The current market has no credential vault, grant redemption, or platform proxy
   path.

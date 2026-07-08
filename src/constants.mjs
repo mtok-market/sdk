@@ -6,5 +6,8 @@
 // or omits feeBps. Do not read this in place of the live value.
 export const DEFAULT_FEE_BPS = 250;
 
-// Minimum on-chain chunk size (USD). Must stay in sync with DEFAULT_REP_KNOBS.chunkFloorUsd.
-export const CHUNK_FLOOR = 0.10;
+// Smallest positive USDC amount the draw contract can move: one 6-decimal USDC atomic.
+export const MIN_DRAW_USD = 0.000001;
+
+// Conservative fallback cap for a first draw when reputation is unavailable.
+export const RECOMMENDED_FIRST_DRAW_USD = 0.10;
