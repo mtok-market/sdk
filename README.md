@@ -83,6 +83,13 @@ const result = await mtok.buy({
   requests,
 });
 
+if (result.status === 'partial') {
+  // Persist or explicitly retry only this tail; completed requests were paid.
+  console.log('unprocessed requests:', result.unprocessed);
+} else if (result.status !== 'ok') {
+  throw new Error(`batch stopped with ${result.status} after paying $${result.paidUsd ?? 0}`);
+}
+
 const matches = new Set();
 for (const [i, completion] of result.completions.entries()) {
   const text = completion.choices?.[0]?.message?.content ?? '';
@@ -115,6 +122,7 @@ await seller.offer({
   price: 0.5,
   relayEndpoint: 'https://your-relay.example.com',
   settlementPubkey: seller.identity.address,
+  requestHashScheme: 'nonce-v1', // only after every relay instance is dual-stack
 });
 ```
 
@@ -141,12 +149,12 @@ relay verifies the on-chain `DrawPaid` before delivering.
 | `Mtok.create(opts)` | Build a client; generates keys if absent. |
 | `Mtok.fromIdentity(identity, opts)` | Restore a saved agent identity. |
 | `register(name)` | Register the agent and publish its signing pubkey. |
-| `offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey })` | Seller: post a signed `tier:"direct"` offer. |
+| `offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey, requestHashScheme })` | Seller: post a signed `tier:"direct"` offer; advertise `nonce-v1` only after the relay fleet is dual-stack. |
 | `bid({ model, inputTokens, outputTokens, maxPrice })` | Buyer: post a signed bid and receive seller-hosted `routes[]`. |
 | `ensureFundedFor(budget)` | Check USDC plus gas for the buyer wallet. |
 | `bindAgentWallet({ contractAddress })` | Contract mode: ask the API for a registrar signature and bind this agent id to this wallet on MtokDripLedger. |
-| `drawFromSeller({ offer, sellerId, totalNeedUsd, request })` | Buyer: pay bounded on-chain drips, draw from the seller relay, then affirm or dispute. |
-| `buy({ model, budget, prompt })` | Higher-level buyer loop that bids, tries routes, and draws. |
+| `drawFromSeller({ offer, sellerId, totalNeedUsd, request, onDrawPrepared, onDrawSubmitted })` | Buyer: persist prepared + submitted recovery state, pay bounded on-chain drips, draw from the seller relay, then affirm or dispute. |
+| `buy({ model, budget, prompt })` | Higher-level buyer loop that tries eligible routes until money moves, then returns that draw's terminal status. |
 | `buildIndexedJsonBatch(items, opts)` | Build chunked OpenAI-style requests for list jobs that should return JSON indexes. |
 | `parseIndexedJsonList(text, labels, opts)` | Parse JSON index lists defensively, ignoring invented labels and out-of-range indexes. |
 
@@ -167,8 +175,42 @@ override `rpcUrl`, `rpcUrls`, or `usdc` only when you know why.
   listing against the contract. If `/config.dripContractAddress` is absent, the
   SDK refuses to draw.
 - The SDK refuses a fee address that does not match its pinned per-chain config.
+- `budget` is an aggregate payment cap. `buy()` may try another route after an
+  unpaid failure, but never after a paid failure. Results expose `paidUsd` for
+  on-chain seller payments and `drawnUsd`/`spentUsd` for metered delivered usage.
+- The signed offer selects the request commitment. `requestHashScheme:"nonce-v1"`
+  binds a random 16-byte nonce into the hash; a missing marker keeps legacy
+  request-only hashing during a rolling deploy. Unknown schemes fail before pay.
+- For crash-safe nonce-v1 recovery, pass awaited `onDrawPrepared(record)` and
+  `onDrawSubmitted(record)` hooks. The first stores the exact
+  booking/request/payment record before `payDraw`; the second adds
+  `drawPaidTxHash` immediately after broadcast and before confirmation.
+  `buy()` and the default `watchAndFill()` path forward both hooks. A preparation
+  failure prevents payment; a submission-persistence failure is terminal
+  `payment_unknown`. Returned paid chunks retain `bookingId`,
+  `requestNonce`, and `requestHash`; treat the nonce as a bearer secret until the
+  draw closes and do not publish it with the chain hash.
+- A batch returns `status: "partial"`, `completedCount`, and `unprocessed` when
+  its budget funds only a prefix. The SDK never labels a prefix `ok` or retries
+  the completed prefix automatically.
 - The current market has no credential vault, grant redemption, or platform proxy
   path.
+
+## Release notes
+
+0.2.0 (breaking):
+
+- `buy()` never re-spends after a paid attempt: a paid failure is terminal for
+  the whole call, and the budget is an aggregate cap across routes. The
+  `all_disputed` status is gone; expect `all_failed`, `partial`,
+  `paid_undelivered`, `payment_unknown`, `paid_unresolved`, `replay`, or
+  `disputed` alongside `ok`.
+- A batch that funds only a prefix returns `status: "partial"` with
+  `unprocessed` requests, never `ok`.
+- `requestHashScheme: "nonce-v1"` support end to end (offers, `drawFromSeller`,
+  `buy`, `watchAndFill`); unknown schemes fail before any payment.
+- `watchAndFill()` requires a positive finite price ceiling for every requested
+  token dimension.
 
 
 ---

@@ -16,6 +16,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 // a hot loop hammering /spot + /book with no backoff; clamp to a sane minimum. A caller
 // that genuinely wants faster polling can still raise it, just not below this.
 const MIN_POLL_MS = 1000;
+const floorUsdAtomic = (value) => Math.floor((Math.max(0, Number(value) || 0) + Number.EPSILON) * 1e6) / 1e6;
 
 export async function watchAndFill(client, {
   bid,                    // the object postBid returned (bidId, model, ceilings, sizes, expiresAt)
@@ -23,6 +24,8 @@ export async function watchAndFill(client, {
   drawFn,                 // optional override: async ({ offer, bid, budgetUsd }) => drawFromSeller-shaped result
   request,                // the inference request(s) the bid exists to run (used by the default drawFn)
   requests,
+  onDrawPrepared,
+  onDrawSubmitted,
   maxPolls = Infinity,    // give up after this many polls (the bid is cancelled so the board stays honest)
   sleep = sleepMs,
 } = {}) {
@@ -39,6 +42,11 @@ export async function watchAndFill(client, {
   const maxOut = Number(bid.maxOutputPricePerMTok) || 0;
   const wantIn = Number(bid.inputTokens) || 0;
   const wantOut = Number(bid.outputTokens) || 0;
+  if ((wantIn > 0 && !(Number.isFinite(maxIn) && maxIn > 0))
+    || (wantOut > 0 && !(Number.isFinite(maxOut) && maxOut > 0))) {
+    throw new Error('watchAndFill: every requested token dimension needs a positive finite price ceiling for bounded automated spending');
+  }
+  const fullBudgetUsd = floorUsdAtomic((wantIn / 1e6) * maxIn + (wantOut / 1e6) * maxOut);
   const expiresAtMs = Number(bid.expiresAt) > 0 ? Number(bid.expiresAt) * 1000 : Infinity;
   const crosses = (inPrice, outPrice) =>
     (maxIn <= 0 || (Number(inPrice) || 0) <= maxIn) && (maxOut <= 0 || (Number(outPrice) || 0) <= maxOut);
@@ -49,7 +57,6 @@ export async function watchAndFill(client, {
   // bid that can never fill. (An explicit drawFn override skips this: the
   // caller owns their sizing.)
   if (!drawFn) {
-    const fullBudgetUsd = (wantIn / 1e6) * maxIn + (wantOut / 1e6) * maxOut;
     if (fullBudgetUsd < MIN_DRAW_USD) {
       throw new Error(
         `watchAndFill: the bid's full budget at its own ceilings (~$${round6Usd(fullBudgetUsd)}) is below the market's minimum draw ($${MIN_DRAW_USD}). ` +
@@ -59,10 +66,14 @@ export async function watchAndFill(client, {
   }
 
   let gotIn = 0, gotOut = 0;
+  let paidUsd = 0;
   const draws = [];
   const result = (status, extra = {}) => ({
-    status, draws, deliveredInputTokens: gotIn, deliveredOutputTokens: gotOut, ...extra,
+    status, draws, paidUsd, fundedUsd: paidUsd, deliveredInputTokens: gotIn, deliveredOutputTokens: gotOut, ...extra,
   });
+  const cancel = async () => {
+    try { return await client.cancelBid(bid.bidId); } catch { return null; }
+  };
 
   for (let polls = 0; ; polls++) {
     if (Date.now() >= expiresAtMs) return result('expired');
@@ -70,8 +81,7 @@ export async function watchAndFill(client, {
       // Giving up on a still-live bid: cancel it so the board stops advertising
       // demand nobody is watching (a stale bid someone lists against and then
       // gets ghosted on scores against this wallet's public bid reputation).
-      let cancelTxHash = null;
-      try { cancelTxHash = await client.cancelBid(bid.bidId); } catch { /* best-effort */ }
+      const cancelTxHash = await cancel();
       return result('cancelled', { cancelTxHash });
     }
     if (polls > 0) await sleep(pollMs);
@@ -94,24 +104,35 @@ export async function watchAndFill(client, {
     const offer = {
       id: o.id, tier: 'direct', relayEndpoint: o.relayEndpoint, model: bid.model,
       inputPricePerMTok: o.inputPricePerMTok, outputPricePerMTok: o.outputPricePerMTok,
-      settlementPubkey: o.settlementPubkey, agentId: o.agentId,
+      settlementPubkey: o.settlementPubkey, requestHashScheme: o.requestHashScheme, agentId: o.agentId,
     };
     // Budget the UNSATISFIED remainder of the bid at the crossing offer's
     // prices: the most this draw should cost if the seller delivers it all.
-    const budgetUsd = round6Usd(
+    const unsatisfiedBudgetUsd = floorUsdAtomic(
       (Math.max(0, wantIn - gotIn) / 1e6) * (Number(o.inputPricePerMTok) || 0)
       + (Math.max(0, wantOut - gotOut) / 1e6) * (Number(o.outputPricePerMTok) || 0),
     );
+    const remainingPaidBudgetUsd = floorUsdAtomic(fullBudgetUsd - paidUsd);
+    if (!drawFn && remainingPaidBudgetUsd < MIN_DRAW_USD) {
+      const cancelTxHash = await cancel();
+      return result('budget_exhausted', { cancelTxHash });
+    }
     // Tail top-up: a nearly-satisfied bid can leave a remainder under one USDC
     // atomic, which would no-op. The default draw rounds only that impossible
     // dust tail up to the contract minimum.
+    const budgetUsd = floorUsdAtomic(Math.min(remainingPaidBudgetUsd, Math.max(unsatisfiedBudgetUsd, MIN_DRAW_USD)));
     const _draw = drawFn ?? (async () => client.drawFromSeller({
-      offer, totalNeedUsd: Math.max(budgetUsd, MIN_DRAW_USD), sellerId: offer.agentId,
+      offer, totalNeedUsd: budgetUsd, sellerId: offer.agentId,
+      onDrawPrepared,
+      onDrawSubmitted,
       ...(Array.isArray(requests) && requests.length ? { requests } : { request }),
     }));
 
     const res = await _draw({ offer, bid, budgetUsd });
     draws.push(res);
+    const paidThisDraw = Number(res?.paidUsd ?? res?.fundedUsd ?? 0) || 0;
+    paidUsd = round6Usd(paidUsd + paidThisDraw);
+    const deliveredThisDraw = (res?.chunks ?? []).some((c) => c.kind === 'draw' && c.completion);
     for (const c of res?.chunks ?? []) {
       if (c.kind !== 'draw' || !c.completion?.usage) continue;
       const u = c.completion.usage;
@@ -119,6 +140,34 @@ export async function watchAndFill(client, {
       gotOut += Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
     }
     const lastDrawId = [...(res?.chunks ?? [])].reverse().find((c) => c.kind === 'draw' && c.drawId)?.drawId ?? null;
+
+    // An RPC-ambiguous payment deliberately reports zero *known* paid amount. It is still
+    // terminal: polling another ask could pay twice while the first transaction settles.
+    if (res?.status === 'payment_unknown' || res?.status === 'paid_unresolved') {
+      const cancelTxHash = await cancel();
+      return result(res.status, {
+        cancelTxHash, disputed: !!res?.disputed,
+        paymentUnknown: res.status === 'payment_unknown',
+      });
+    }
+    // Once money moved, an undelivered/disputed draw is terminal. Polling again
+    // would silently spend a fresh budget against the same still-advertised bid.
+    if (paidThisDraw > 0 && (res?.disputed || !deliveredThisDraw)) {
+      const cancelTxHash = await cancel();
+      return result(res?.disputed ? 'disputed' : 'paid_undelivered', { cancelTxHash, disputed: !!res?.disputed });
+    }
+    // A batch prefix is useful, but retrying the whole request list here would
+    // pay for that prefix twice. Return the exact tail for an explicit retry.
+    if (res?.partial || res?.replay) {
+      const cancelTxHash = await cancel();
+      return result(res.replay ? 'replay' : 'partial', {
+        cancelTxHash,
+        requestedCount: res.requestedCount,
+        completedCount: res.completedCount,
+        unprocessedCount: res.unprocessedCount,
+        unprocessed: res.unprocessed,
+      });
+    }
 
     // Fully satisfied: link the bid to the draw that closed it out. In stage A
     // fillBid retires the WHOLE bid (there are no partial fills on chain), so
@@ -136,7 +185,11 @@ export async function watchAndFill(client, {
       try { fillTxHash = await client.fillBid(bid.bidId, lastDrawId); } catch { /* best-effort; the paid draws stand */ }
       return result('filled', { drawId: lastDrawId, fillTxHash });
     }
-    // Partial (or disputed) draw: keep watching; the next crossing ask covers
+    if (floorUsdAtomic(fullBudgetUsd - paidUsd) < MIN_DRAW_USD) {
+      const cancelTxHash = await cancel();
+      return result('budget_exhausted', { cancelTxHash });
+    }
+    // A delivered partial draw can keep watching; the next crossing ask covers
     // what is still owed.
   }
 }

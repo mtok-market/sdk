@@ -100,9 +100,18 @@ export class Mtok {
   // payoutAddress is REQUIRED by the non-custodial server (where buyers pay you); it
   // is signed INTO the intent params (the router rebuilds the order from intent.params).
   // For a direct offer it is the same wallet as settlementPubkey, so it defaults to it.
-  async offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey, payoutAddress, usableForSeconds = 3600, recurring = false }) {
+  async offer({ model, inputTokens, outputTokens, price, relayEndpoint, settlementPubkey, payoutAddress, requestHashScheme, usableForSeconds = 3600, recurring = false }) {
     if (!(Number(price) > 0)) throw new Error('offer: price must be > 0 (price-0 is banned)');
-    const params = { inputTokens, outputTokens, inputPricePerMTok: price, outputPricePerMTok: price, tier: 'direct', relayEndpoint, settlementPubkey, payoutAddress: payoutAddress ?? settlementPubkey, usableForSeconds, recurring };
+    if (requestHashScheme != null && requestHashScheme !== 'nonce-v1') {
+      throw new Error('offer: requestHashScheme must be "nonce-v1" or omitted for legacy relays');
+    }
+    const params = {
+      inputTokens, outputTokens, inputPricePerMTok: price, outputPricePerMTok: price,
+      tier: 'direct', relayEndpoint, settlementPubkey,
+      payoutAddress: payoutAddress ?? settlementPubkey,
+      ...(requestHashScheme ? { requestHashScheme } : {}),
+      usableForSeconds, recurring,
+    };
     const r = await this._req('POST', '/offers', this._sign('offer', model, params));
     if (r.status !== 201) throw new Error('offer failed: ' + JSON.stringify(r.body));
     return r.body.order;
@@ -172,12 +181,12 @@ export class Mtok {
     const r = signature.slice(0, 66), s = '0x' + signature.slice(66, 130), v = parseInt(signature.slice(130, 132), 16);
     return this._confirm(await this._write({ address: this.usdc, abi: TWA, functionName: 'transferWithAuthorization', args: [a.from, a.to, BigInt(a.value), BigInt(a.validAfter), BigInt(a.validBefore), a.nonce, v, r, s] }));
   }
-  // Contract-mode replay guard: read the on-chain DrawStatus for a drawId. A payDraw is
-  // idempotent by drawId (payDraw reverts DrawAlreadyExists once status != None), so before
-  // re-submitting on a retry we check whether this exact draw already landed — a prior
-  // attempt could have paid but stranded before we recorded the hash (mtok-market#128).
-  // Returns one of DRAW_STATUS (None=unpaid, Paid, Affirmed, Disputed). Reads fail-open to
-  // None so a flaky RPC never blocks a genuine first payment.
+  // Contract-mode recovery read. After payDraw errors, callers distinguish a confirmed
+  // on-chain draw from confirmed None and from an unavailable/lagging RPC. payDraw itself is
+  // idempotent by drawId (it reverts DrawAlreadyExists once status != None).
+  // Returns one of DRAW_STATUS (None=unpaid, Paid, Affirmed, Disputed), or null when the
+  // read itself failed. Conflating an unavailable RPC with confirmed None can authorize a
+  // second payment after an ambiguous first submission.
   async _drawStatus(contractAddress, drawId) {
     try {
       const rec = await this.pub.readContract({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'draws', args: [drawId] });
@@ -185,10 +194,10 @@ export class Mtok {
       // paidAt, status): status is index 6. #543 added `address buyer` at index 2; the ABI +
       // this index MUST track it or the replay/terminal-idempotency guard reads paidAt as status.
       return Number(rec?.[6] ?? DRAW_STATUS.None);
-    } catch { return DRAW_STATUS.None; }
+    } catch { return null; }
   }
 
-  async _payDraw(contractAddress, payment) {
+  async _payDraw(contractAddress, payment, { onSubmitted } = {}) {
     // #451: USDC approve is an absolute SET, not an increment, and this
     // approve-then-payDraw sequence has awaits between the legs. Two concurrent
     // draws on ONE client (blessed: a watchAndFill payDraw while another watcher
@@ -199,8 +208,43 @@ export class Mtok {
     // queue and each draw's allowance is intact when its payDraw runs.
     const run = (this._drawChain ?? Promise.resolve()).then(async () => {
       const total = BigInt(payment.sellerUsdAtomic) + BigInt(payment.feeUsdAtomic || 0n);
-      await this._approveAndWait(contractAddress, total);
-      return this._confirm(await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'payDraw', args: [payment] }));
+      try {
+        await this._approveAndWait(contractAddress, total);
+      } catch (cause) {
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        error.paymentUnpaid = true;
+        error.paymentStage = 'approve';
+        throw error;
+      }
+      let hash;
+      try {
+        hash = await this._write({ address: contractAddress, abi: DRIP_LEDGER, functionName: 'payDraw', args: [payment] });
+      } catch (cause) {
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        error.paymentStage = 'submit';
+        throw error;
+      }
+      if (onSubmitted) {
+        try {
+          await onSubmitted(hash);
+        } catch (cause) {
+          const error = cause instanceof Error ? cause : new Error(String(cause));
+          error.txHash = hash;
+          error.paymentSubmitted = true;
+          error.paymentStage = 'persist_submission';
+          throw error;
+        }
+      }
+      try {
+        return await this._confirm(hash);
+      } catch (cause) {
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        error.txHash = hash;
+        error.paymentStage = 'confirm';
+        if (/tx reverted/i.test(String(error?.message ?? error))) error.paymentUnpaid = true;
+        else error.paymentSubmitted = true;
+        throw error;
+      }
     });
     // Keep the chain alive regardless of THIS draw's outcome so the next queued
     // draw still runs (mirrors _write's tail-swallow).
@@ -252,7 +296,7 @@ export class Mtok {
     for (let i = 0; i < 8; i++) {
       const status = await this._drawStatus(contractAddress, drawId);
       if (status === terminalStatus) return null; // already in the target terminal state (a prior attempt landed)
-      if (status !== DRAW_STATUS.None) break; // Paid and visible on at least one node: safe to submit
+      if (status != null && status !== DRAW_STATUS.None) break; // Paid and visible on at least one node: safe to submit
       await new Promise((r) => setTimeout(r, 1500));
     }
     let lastErr;
