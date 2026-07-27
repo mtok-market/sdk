@@ -198,6 +198,14 @@ override `rpcUrl`, `rpcUrls`, or `usdc` only when you know why.
 
 ## Release notes
 
+0.2.1:
+
+- Input-estimate fix (#626). The client-side estimate counted one token per UTF-8
+  byte, the same worst case the relay used, so a well-funded prompt could be
+  judged unaffordable (or paid for and then refused by a relay whose estimate ran
+  even higher). It now matches `mtok-bridge` exactly: bytes with a ~25% margin.
+  A drift test pins the two implementations together.
+
 0.2.0 (breaking):
 
 - `buy()` never re-spends after a paid attempt: a paid failure is terminal for

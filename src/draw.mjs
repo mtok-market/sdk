@@ -7,8 +7,22 @@ const contractBookingId = () => 'bkgc_' + crypto.randomBytes(12).toString('base6
 const floorUsdAtomic = (value) => Math.floor((Math.max(0, Number(value) || 0) + Number.EPSILON) * 1e6) / 1e6;
 const REQUEST_KEYS = new Set(['model', 'messages', 'max_tokens', 'temperature', 'response_format', 'stream', 'n']);
 const MESSAGE_ROLES = new Set(['developer', 'system', 'user', 'assistant']);
-const estimateInputTokens = (messages) => 3 + messages.reduce((tokens, message) =>
-  tokens + 4 + Buffer.byteLength(message.role, 'utf8') + Buffer.byteLength(message.content, 'utf8'), 0);
+// Client-side twin of mtok-bridge's estimateInputTokens. KEEP THE MATH IN SYNC:
+// the SDK uses it to decide whether a draw is worth paying for, the relay uses
+// it to decide whether to serve one that was already paid. If the SDK estimates
+// LOW and the relay HIGH, the buyer pays and is then refused, which is exactly
+// how #626 broke a real buyer for two weeks. draw.test.js pins the two together.
+// Bytes with a ~25% margin over the English average, not one token per byte.
+const BYTES_PER_TOKEN_EST = 3.2;
+export const estimateInputTokens = (messages) => {
+  let envelope = 3;
+  let bytes = 0;
+  for (const message of messages) {
+    envelope += 4;
+    bytes += Buffer.byteLength(message.role, 'utf8') + Buffer.byteLength(message.content, 'utf8');
+  }
+  return envelope + Math.ceil(bytes / BYTES_PER_TOKEN_EST);
+};
 
 function normalizeRelayRequest(request) {
   let normalized;
